@@ -2,7 +2,7 @@
 CREATE EXTENSION IF NOT EXISTS citext;
 
 CREATE TYPE user_role AS ENUM
-  ('customer', 'organizer', 'event_admin', 'platform_admin', 'gate_attendant');
+  ('customer', 'organizer', 'platform_admin');
 
 CREATE TABLE users (
   id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
