@@ -34,6 +34,11 @@ func (h *Handler) Routes(r chi.Router) {
 	r.Post("/auth/login", h.login)
 	r.Post("/auth/refresh", h.refresh)
 	r.Post("/auth/logout", h.logout)
+
+	r.Group(func(r chi.Router) {
+		r.Use(Authenticate(h.svc.tokens))
+		r.Get("/auth/me", h.me)
+	})
 }
 
 //  -- register --
@@ -220,6 +225,21 @@ func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
 			RefreshToken: res.RefreshToken,
 		})
 	}
+}
+
+
+// -- me returns the caller's profile information. It is protected by the Authenticate middleware, which ensures that the request has a valid access token and extracts the caller's identity from it.
+func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
+	id, ok := IdentityFrom(r.Context())
+	if !ok { // can't happen behind Authenticate; defensive
+		httpx.WriteError(w, http.StatusUnauthorized, "missing_token", "authentication required", nil)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{
+		"user_id":    id.UserID,
+		"role":       id.Role,
+		"session_id": id.SessionID,
+	})
 }
 
 // -- logout --
