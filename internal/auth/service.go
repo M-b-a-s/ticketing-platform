@@ -30,6 +30,7 @@ type SessionStore interface {
 	RotateSession(ctx context.Context, arg db.RotateSessionParams) (db.RotateSessionRow, error)
 	GetSessionByPreviousHash(ctx context.Context, hash string) (db.GetSessionByPreviousHashRow, error)
 	RevokeSession(ctx context.Context, id pgtype.UUID) error
+	RevokeSessionByRefreshHash(ctx context.Context, refreshTokenHash string) error
 }
 
 type Config struct {
@@ -303,4 +304,15 @@ func (s *Service) rejectUnrotatable(ctx context.Context, oldHash string) error {
 		return err // fail loudly: a failed revoke is a security problem
 	}
 	return ErrRefreshReuse
+}
+
+// -- logout --
+
+// Logout revokes the session holding this refresh token. It is idempotent:
+// an unknown, expired or already-revoked token is not an error.
+func (s *Service) Logout(ctx context.Context, refreshToken string) error {
+	if refreshToken == "" || len(refreshToken) > 256 {
+		return nil
+	}
+	return s.sessions.RevokeSessionByRefreshHash(ctx, HashRefreshToken(refreshToken))
 }

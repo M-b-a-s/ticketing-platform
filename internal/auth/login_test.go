@@ -87,6 +87,15 @@ func (f *fakeSessions) RevokeSession(_ context.Context, id pgtype.UUID) error {
 	return nil
 }
 
+func (f *fakeSessions) RevokeSessionByRefreshHash(_ context.Context, hash string) error {
+	for _, s := range f.sessions {
+		if s.hash == hash {
+			s.revoked = true
+		}
+	}
+	return nil
+}
+
 func existingUser(t *testing.T, password string) *fakeLoginStore {
 	t.Helper()
 	hash, err := HashPassword(password, testParams)

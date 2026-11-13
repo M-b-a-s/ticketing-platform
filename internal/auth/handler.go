@@ -33,6 +33,7 @@ func (h *Handler) Routes(r chi.Router) {
 	r.Post("/auth/register", h.register)
 	r.Post("/auth/login", h.login)
 	r.Post("/auth/refresh", h.refresh)
+	r.Post("/auth/logout", h.logout)
 }
 
 //  -- register --
@@ -219,4 +220,26 @@ func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
 			RefreshToken: res.RefreshToken,
 		})
 	}
+}
+
+// -- logout --
+
+func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	var req refreshRequest
+	if err := dec.Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_json", "request body is not valid JSON or has unknown fields", nil)
+		return
+	}
+
+	if err := h.svc.Logout(r.Context(), req.RefreshToken); err != nil {
+		h.log.ErrorContext(r.Context(), "logout failed", "error", err)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "something went wrong", nil)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
