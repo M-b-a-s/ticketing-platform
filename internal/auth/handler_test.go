@@ -13,7 +13,7 @@ import (
 )
 
 func newTestRouter(store UserStore) http.Handler {
-	h := NewHandler(NewService(store, testParams), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := NewHandler(newSvc(store, nil), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r := chi.NewRouter()
 	h.Routes(r)
 	return r

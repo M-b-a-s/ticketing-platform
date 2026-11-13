@@ -48,8 +48,20 @@ func run() error {
 	}
 
 	// NEW: wire auth
+	jwtSecret := os.Getenv("JWT_SECRET")
+	tokens, err := auth.NewTokenManager(jwtSecret, 15*time.Minute)
+	if err != nil {
+		return err
+	}
+
 	queries := db.New(pool)
-	authSvc := auth.NewService(queries, auth.DefaultParams)
+	authSvc, err := auth.NewService(queries, queries, tokens, auth.DefaultParams, auth.Config{
+		RefreshTTL:          30 * 24 * time.Hour,
+		MaxConcurrentHashes: 4,
+	})
+	if err != nil {
+		return err
+	}
 	authHandler := auth.NewHandler(authSvc, slog.Default())
 
 	// CHANGED: chi router instead of http.ServeMux

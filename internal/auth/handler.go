@@ -7,6 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+	"context"
+	"net"
+	"net/netip"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -28,7 +31,10 @@ func NewHandler(svc *Service, log *slog.Logger) *Handler {
 
 func (h *Handler) Routes(r chi.Router) {
 	r.Post("/auth/register", h.register)
+	r.Post("/auth/login", h.login)
 }
+
+//  -- register --
 
 type registerRequest struct {
 	Email    string `json:"email"`
@@ -91,4 +97,78 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 	default:
 		httpx.WriteJSON(w, http.StatusCreated, newUserResponse(user))
 	}
+}
+
+// -- login --
+
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type loginResponse struct {
+	AccessToken  string       `json:"access_token"`
+	TokenType    string       `json:"token_type"`
+	ExpiresAt    time.Time    `json:"expires_at"`
+	RefreshToken string       `json:"refresh_token"`
+	User         userResponse `json:"user"`
+}
+
+func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	var req loginRequest
+	if err := dec.Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_json", "request body is not valid JSON or has unknown fields", nil)
+		return
+	}
+
+	res, err := h.svc.Login(r.Context(), LoginInput{
+		Email:     req.Email,
+		Password:  req.Password,
+		UserAgent: r.UserAgent(),
+		IP:        clientIP(r),
+	})
+
+	switch {
+	case errors.Is(err, ErrInvalidCredentials):
+		httpx.WriteError(w, http.StatusUnauthorized, "invalid_credentials", "email or password is incorrect", nil)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		httpx.WriteError(w, http.StatusServiceUnavailable, "busy", "server is busy, try again shortly", nil)
+	case err != nil:
+		h.log.ErrorContext(r.Context(), "login failed", "error", err)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "something went wrong", nil)
+	default:
+		w.Header().Set("Cache-Control", "no-store")
+		httpx.WriteJSON(w, http.StatusOK, loginResponse{
+			AccessToken:  res.AccessToken,
+			TokenType:    "Bearer",
+			ExpiresAt:    res.AccessExpiresAt,
+			RefreshToken: res.RefreshToken,
+			User: userResponse{
+				ID:       res.User.ID,
+				Email:    res.User.Email,
+				FullName: res.User.FullName,
+				Role:     res.User.Role,
+			},
+		})
+	}
+}
+
+
+// clientIP uses the socket address. Behind Nginx this is the proxy's address;
+// we'll revisit trusted forwarding headers at deployment (Phase 10).
+func clientIP(r *http.Request) *netip.Addr {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return nil
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return nil
+	}
+	return &addr
 }

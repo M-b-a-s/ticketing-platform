@@ -2,9 +2,15 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/mail"
+	"net/netip"
 	"strings"
+	"time"
 	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/database/db"
 )
@@ -14,21 +20,88 @@ const (
 	MaxNameLen     = 100
 )
 
-// UserStore defines the interface for user storage operations.
 type UserStore interface {
 	CreateUser(ctx context.Context, arg db.CreateUserParams) (db.CreateUserRow, error)
+	GetUserByEmail(ctx context.Context, email string) (db.GetUserByEmailRow, error)
 }
 
-// Service provides authentication-related operations.
+type SessionStore interface {
+	CreateSession(ctx context.Context, arg db.CreateSessionParams) (db.CreateSessionRow, error)
+}
+
+type Config struct {
+	RefreshTTL          time.Duration // default 30 days
+	MaxConcurrentHashes int           // default 4; each hash uses Params.Memory
+}
+
 type Service struct {
-	users UserStore
-	params Params
+	users     UserStore
+	sessions  SessionStore
+	tokens    *TokenManager
+	params    Params
+	cfg       Config
+	sem       chan struct{}
+	dummyHash string
+	now       func() time.Time
 }
 
-// NewService creates a new instance of the Service with the provided UserStore and Params.
-func NewService(users UserStore, params Params) *Service {
-	return &Service{users: users, params: params}
+func NewService(users UserStore, sessions SessionStore, tokens *TokenManager, params Params, cfg Config) (*Service, error) {
+	if cfg.MaxConcurrentHashes <= 0 {
+		cfg.MaxConcurrentHashes = 4
+	}
+	if cfg.RefreshTTL <= 0 {
+		cfg.RefreshTTL = 30 * 24 * time.Hour
+	}
+
+	// Verified against when the email doesn't exist, so "unknown email" costs
+	// the same time as "wrong password" and response time leaks nothing.
+	dummy, err := HashPassword("dummy-password-for-timing", params)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Service{
+		users:     users,
+		sessions:  sessions,
+		tokens:    tokens,
+		params:    params,
+		cfg:       cfg,
+		sem:       make(chan struct{}, cfg.MaxConcurrentHashes),
+		dummyHash: dummy,
+		now:       time.Now,
+	}, nil
 }
+
+// ---- concurrency cap on password hashing ----
+
+func (s *Service) acquire(ctx context.Context) (func(), error) {
+	select {
+	case s.sem <- struct{}{}:
+		return func() { <-s.sem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *Service) hashPassword(ctx context.Context, password string) (string, error) {
+	release, err := s.acquire(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	return HashPassword(password, s.params)
+}
+
+func (s *Service) verifyPassword(ctx context.Context, password, hash string) (bool, error) {
+	release, err := s.acquire(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	return VerifyPassword(password, hash)
+}
+
+// ---- registration ----
 
 type RegisterInput struct {
 	Email    string
@@ -36,14 +109,12 @@ type RegisterInput struct {
 	FullName string
 }
 
-// Validate checks the validity of the RegisterInput fields and returns a ValidationError if any field is invalid.
 type ValidationError struct {
 	Fields map[string]string
 }
 
 func (e *ValidationError) Error() string { return "auth: validation failed" }
 
-// normalizeAndValidate trims whitespace from the input fields and validates them according to the defined rules.
 func (in *RegisterInput) normalizeAndValidate() error {
 	in.Email = strings.TrimSpace(in.Email)
 	in.FullName = strings.TrimSpace(in.FullName)
@@ -68,13 +139,12 @@ func (in *RegisterInput) normalizeAndValidate() error {
 	return nil
 }
 
-// Register creates a new user in the database after validating the input and hashing the password. It returns the created user or an error if the operation fails.
 func (s *Service) Register(ctx context.Context, in RegisterInput) (db.CreateUserRow, error) {
 	if err := in.normalizeAndValidate(); err != nil {
 		return db.CreateUserRow{}, err
 	}
 
-	hash, err := HashPassword(in.Password, s.params)
+	hash, err := s.hashPassword(ctx, in.Password)
 	if err != nil {
 		return db.CreateUserRow{}, err
 	}
@@ -91,4 +161,88 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (db.CreateUser
 		return db.CreateUserRow{}, err
 	}
 	return user, nil
+}
+
+// ---- login ----
+
+type LoginInput struct {
+	Email     string
+	Password  string
+	UserAgent string
+	IP        *netip.Addr
+}
+
+type UserProfile struct {
+	ID       string
+	Email    string
+	FullName string
+	Role     string
+}
+
+type LoginResult struct {
+	AccessToken     string
+	AccessExpiresAt time.Time
+	RefreshToken    string
+	User            UserProfile
+}
+
+// Login returns ErrInvalidCredentials for BOTH an unknown email and a wrong
+// password, so callers cannot tell which accounts exist.
+func (s *Service) Login(ctx context.Context, in LoginInput) (*LoginResult, error) {
+	email := strings.TrimSpace(in.Email)
+	if email == "" || in.Password == "" || len(in.Password) > MaxPasswordLen {
+		return nil, ErrInvalidCredentials
+	}
+
+	user, err := s.users.GetUserByEmail(ctx, email)
+	found := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+
+	hash := s.dummyHash
+	if found {
+		hash = user.PasswordHash
+	}
+
+	ok, err := s.verifyPassword(ctx, in.Password, hash)
+	if err != nil {
+		return nil, err
+	}
+	if !found || !ok {
+		return nil, ErrInvalidCredentials
+	}
+
+	refreshToken, refreshHash, err := NewRefreshToken()
+	if err != nil {
+		return nil, err
+	}
+
+	sess, err := s.sessions.CreateSession(ctx, db.CreateSessionParams{
+		UserID:           user.ID,
+		RefreshTokenHash: refreshHash,
+		UserAgent:        pgtype.Text{String: in.UserAgent, Valid: in.UserAgent != ""},
+		Ip:               in.IP,
+		ExpiresAt:        pgtype.Timestamptz{Time: s.now().Add(s.cfg.RefreshTTL), Valid: true},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	accessToken, accessExp, err := s.tokens.Issue(uuidString(user.ID), uuidString(sess.ID), string(user.Role))
+	if err != nil {
+		return nil, err
+	}
+
+	return &LoginResult{
+		AccessToken:     accessToken,
+		AccessExpiresAt: accessExp,
+		RefreshToken:    refreshToken,
+		User: UserProfile{
+			ID:       uuidString(user.ID),
+			Email:    user.Email,
+			FullName: user.FullName,
+			Role:     string(user.Role),
+		},
+	}, nil
 }

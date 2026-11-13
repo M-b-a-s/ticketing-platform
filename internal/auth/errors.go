@@ -7,6 +7,7 @@ import (
 )
 
 var ErrEmailTaken = errors.New("auth: email already registered")
+var ErrInvalidCredentials = errors.New("auth: invalid email or password")
 
 const (
 	pgUniqueViolation = "23505"

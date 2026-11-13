@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/database/db"
 )
@@ -22,13 +24,29 @@ func (f *fakeStore) CreateUser(_ context.Context, arg db.CreateUserParams) (db.C
 	return db.CreateUserRow{Email: arg.Email, FullName: arg.FullName}, f.err
 }
 
+func (f *fakeStore) GetUserByEmail(context.Context, string) (db.GetUserByEmailRow, error) {
+	return db.GetUserByEmailRow{}, pgx.ErrNoRows
+}
+
 func validInput() RegisterInput {
 	return RegisterInput{Email: "ada@example.com", Password: "a-long-enough-password", FullName: "Ada Obi"}
 }
 
+func newSvc(users UserStore, sessions SessionStore) *Service {
+	tm, err := NewTokenManager(testSecret, 15*time.Minute)
+	if err != nil {
+		panic(err)
+	}
+	svc, err := NewService(users, sessions, tm, testParams, Config{RefreshTTL: time.Hour, MaxConcurrentHashes: 2})
+	if err != nil {
+		panic(err)
+	}
+	return svc
+}
+
 func TestRegisterSuccess(t *testing.T) {
 	store := &fakeStore{}
-	svc := NewService(store, testParams)
+	svc := newSvc(store, nil)
 
 	if _, err := svc.Register(context.Background(), validInput()); err != nil {
 		t.Fatal(err)
@@ -50,7 +68,7 @@ func TestRegisterValidation(t *testing.T) {
 			in := validInput()
 			mutate(&in)
 
-			_, err := NewService(store, testParams).Register(context.Background(), in)
+			_, err := newSvc(store, nil).Register(context.Background(), in)
 
 			var ve *ValidationError
 			if !errors.As(err, &ve) || ve.Fields[field] == "" {
@@ -66,7 +84,7 @@ func TestRegisterValidation(t *testing.T) {
 func TestRegisterDuplicateEmail(t *testing.T) {
 	store := &fakeStore{err: &pgconn.PgError{Code: "23505", ConstraintName: "users_email_uniq"}}
 
-	_, err := NewService(store, testParams).Register(context.Background(), validInput())
+	_, err := newSvc(store, nil).Register(context.Background(), validInput())
 	if !errors.Is(err, ErrEmailTaken) {
 		t.Fatalf("expected ErrEmailTaken, got %v", err)
 	}
