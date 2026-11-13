@@ -32,14 +32,59 @@ func (f *fakeLoginStore) GetUserByEmail(context.Context, string) (db.GetUserByEm
 	}
 	return f.user, nil
 }
+type fakeSession struct {
+	id      pgtype.UUID
+	userID  pgtype.UUID
+	hash    string
+	prev    string
+	revoked bool
+	expired bool
+	role    db.UserRole
+}
 
 type fakeSessions struct {
 	created []db.CreateSessionParams
+	sessions []*fakeSession
 }
 
 func (f *fakeSessions) CreateSession(_ context.Context, arg db.CreateSessionParams) (db.CreateSessionRow, error) {
 	f.created = append(f.created, arg)
-	return db.CreateSessionRow{ID: pgtype.UUID{Bytes: [16]byte{1}, Valid: true}, UserID: arg.UserID}, nil
+	s := &fakeSession{
+		id:     pgtype.UUID{Bytes: [16]byte{byte(len(f.sessions) + 1)}, Valid: true},
+		userID: arg.UserID,
+		hash:   arg.RefreshTokenHash,
+		role:   db.UserRoleCustomer,
+	}
+	f.sessions = append(f.sessions, s)
+	return db.CreateSessionRow{ID: s.id, UserID: s.userID}, nil
+}
+
+func (f *fakeSessions) RotateSession(_ context.Context, arg db.RotateSessionParams) (db.RotateSessionRow, error) {
+	for _, s := range f.sessions {
+		if s.hash == arg.OldHash && !s.revoked && !s.expired {
+			s.prev, s.hash = s.hash, arg.NewHash
+			return db.RotateSessionRow{ID: s.id, UserID: s.userID, Role: s.role}, nil
+		}
+	}
+	return db.RotateSessionRow{}, pgx.ErrNoRows
+}
+
+func (f *fakeSessions) GetSessionByPreviousHash(_ context.Context, hash string) (db.GetSessionByPreviousHashRow, error) {
+	for _, s := range f.sessions {
+		if s.prev == hash && !s.revoked {
+			return db.GetSessionByPreviousHashRow{ID: s.id, UserID: s.userID}, nil
+		}
+	}
+	return db.GetSessionByPreviousHashRow{}, pgx.ErrNoRows
+}
+
+func (f *fakeSessions) RevokeSession(_ context.Context, id pgtype.UUID) error {
+	for _, s := range f.sessions {
+		if s.id == id {
+			s.revoked = true
+		}
+	}
+	return nil
 }
 
 func existingUser(t *testing.T, password string) *fakeLoginStore {

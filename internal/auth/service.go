@@ -27,6 +27,9 @@ type UserStore interface {
 
 type SessionStore interface {
 	CreateSession(ctx context.Context, arg db.CreateSessionParams) (db.CreateSessionRow, error)
+	RotateSession(ctx context.Context, arg db.RotateSessionParams) (db.RotateSessionRow, error)
+	GetSessionByPreviousHash(ctx context.Context, hash string) (db.GetSessionByPreviousHashRow, error)
+	RevokeSession(ctx context.Context, id pgtype.UUID) error
 }
 
 type Config struct {
@@ -245,4 +248,59 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (*LoginResult, error
 			Role:     string(user.Role),
 		},
 	}, nil
+}
+
+// ---- refresh ----
+
+type RefreshResult struct {
+	AccessToken     string
+	AccessExpiresAt time.Time
+	RefreshToken    string
+}
+
+// Refresh swaps a valid refresh token for a new access token AND a new
+// refresh token. The old refresh token stops working immediately.
+func (s *Service) Refresh(ctx context.Context, refreshToken string) (*RefreshResult, error) {
+	if refreshToken == "" || len(refreshToken) > 256 {
+		return nil, ErrInvalidToken
+	}
+	oldHash := HashRefreshToken(refreshToken)
+
+	newToken, newHash, err := NewRefreshToken()
+	if err != nil {
+		return nil, err
+	}
+
+	sess, err := s.sessions.RotateSession(ctx, db.RotateSessionParams{OldHash: oldHash, NewHash: newHash})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, s.rejectUnrotatable(ctx, oldHash)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	access, exp, err := s.tokens.Issue(uuidString(sess.UserID), uuidString(sess.ID), string(sess.Role))
+	if err != nil {
+		return nil, err
+	}
+
+	return &RefreshResult{AccessToken: access, AccessExpiresAt: exp, RefreshToken: newToken}, nil
+}
+
+// rejectUnrotatable runs when no active session holds this token. If the token
+// was the PREVIOUS one for a live session, someone is replaying a token that
+// was already exchanged. Either the client or an attacker has a stale copy,
+// and we can't tell which, so we revoke the whole session.
+func (s *Service) rejectUnrotatable(ctx context.Context, oldHash string) error {
+	reused, err := s.sessions.GetSessionByPreviousHash(ctx, oldHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrInvalidToken
+	}
+	if err != nil {
+		return err
+	}
+	if err := s.sessions.RevokeSession(ctx, reused.ID); err != nil {
+		return err // fail loudly: a failed revoke is a security problem
+	}
+	return ErrRefreshReuse
 }

@@ -18,6 +18,9 @@ const (
 )
 
 var ErrInvalidToken = errors.New("auth: invalid or expired token")
+// ErrRefreshReuse wraps ErrInvalidToken, so callers that don't care about the
+// difference treat it as a plain 401, while the handler can log it loudly.
+var ErrRefreshReuse = fmt.Errorf("%w: refresh token reuse detected", ErrInvalidToken)
 
 // ---- Refresh tokens: random, opaque, stored only as a hash ----
 

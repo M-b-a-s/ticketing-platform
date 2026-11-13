@@ -32,6 +32,7 @@ func NewHandler(svc *Service, log *slog.Logger) *Handler {
 func (h *Handler) Routes(r chi.Router) {
 	r.Post("/auth/register", h.register)
 	r.Post("/auth/login", h.login)
+	r.Post("/auth/refresh", h.refresh)
 }
 
 //  -- register --
@@ -126,6 +127,7 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The login handler calls the service's Login method with the provided email and password, along with the user agent and client IP address. It handles different error cases, returning appropriate HTTP status codes and messages. If successful, it returns a JSON response containing the access token, refresh token, expiration time, and user profile information.
 	res, err := h.svc.Login(r.Context(), LoginInput{
 		Email:     req.Email,
 		Password:  req.Password,
@@ -171,4 +173,50 @@ func clientIP(r *http.Request) *netip.Addr {
 		return nil
 	}
 	return &addr
+}
+
+// -- refresh --
+type refreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+type refreshResponse struct {
+	AccessToken  string    `json:"access_token"`
+	TokenType    string    `json:"token_type"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	RefreshToken string    `json:"refresh_token"`
+}
+
+func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	var req refreshRequest
+	if err := dec.Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_json", "request body is not valid JSON or has unknown fields", nil)
+		return
+	}
+
+	res, err := h.svc.Refresh(r.Context(), req.RefreshToken)
+
+	switch {
+	case errors.Is(err, ErrRefreshReuse): // must come first: it wraps ErrInvalidToken
+		h.log.WarnContext(r.Context(), "refresh token reuse detected; session revoked")
+		httpx.WriteError(w, http.StatusUnauthorized, "invalid_token", "refresh token is invalid or expired", nil)
+	case errors.Is(err, ErrInvalidToken):
+		httpx.WriteError(w, http.StatusUnauthorized, "invalid_token", "refresh token is invalid or expired", nil)
+	case err != nil:
+		h.log.ErrorContext(r.Context(), "refresh failed", "error", err)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "something went wrong", nil)
+	default:
+		w.Header().Set("Cache-Control", "no-store")
+		httpx.WriteJSON(w, http.StatusOK, refreshResponse{
+			AccessToken:  res.AccessToken,
+			TokenType:    "Bearer",
+			ExpiresAt:    res.AccessExpiresAt,
+			RefreshToken: res.RefreshToken,
+		})
+	}
 }

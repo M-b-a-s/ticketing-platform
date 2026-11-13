@@ -48,7 +48,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (C
 const getSessionByPreviousHash = `-- name: GetSessionByPreviousHash :one
 SELECT id, user_id
 FROM sessions
-WHERE previous_token_hash = $1
+WHERE previous_token_hash = $1::text
   AND revoked_at IS NULL
 `
 
@@ -57,8 +57,8 @@ type GetSessionByPreviousHashRow struct {
 	UserID pgtype.UUID `json:"user_id"`
 }
 
-func (q *Queries) GetSessionByPreviousHash(ctx context.Context, previousTokenHash pgtype.Text) (GetSessionByPreviousHashRow, error) {
-	row := q.db.QueryRow(ctx, getSessionByPreviousHash, previousTokenHash)
+func (q *Queries) GetSessionByPreviousHash(ctx context.Context, hash string) (GetSessionByPreviousHashRow, error) {
+	row := q.db.QueryRow(ctx, getSessionByPreviousHash, hash)
 	var i GetSessionByPreviousHashRow
 	err := row.Scan(&i.ID, &i.UserID)
 	return i, err
@@ -87,32 +87,44 @@ func (q *Queries) RevokeSessionByRefreshHash(ctx context.Context, refreshTokenHa
 }
 
 const rotateSession = `-- name: RotateSession :one
-UPDATE sessions
-SET previous_token_hash = refresh_token_hash,
-    refresh_token_hash  = $2,
-    last_used_at        = now(),
-    updated_at          = now()
-WHERE refresh_token_hash = $1
-  AND revoked_at IS NULL
-  AND expires_at > now()
-RETURNING id, user_id, expires_at
+WITH rotated AS (
+  UPDATE sessions
+  SET previous_token_hash = refresh_token_hash,
+      refresh_token_hash  = $1,
+      last_used_at        = now(),
+      updated_at          = now()
+  WHERE refresh_token_hash = $2
+    AND revoked_at IS NULL
+    AND expires_at > now()
+  RETURNING id, user_id, expires_at
+)
+SELECT r.id, r.user_id, r.expires_at, u.role
+FROM rotated r
+JOIN users u ON u.id = r.user_id
 `
 
 type RotateSessionParams struct {
-	RefreshTokenHash   string `json:"refresh_token_hash"`
-	RefreshTokenHash_2 string `json:"refresh_token_hash_2"`
+	NewHash string `json:"new_hash"`
+	OldHash string `json:"old_hash"`
 }
 
 type RotateSessionRow struct {
 	ID        pgtype.UUID        `json:"id"`
 	UserID    pgtype.UUID        `json:"user_id"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	Role      UserRole           `json:"role"`
 }
 
 // Atomic: only one concurrent caller can match the current hash.
+// Returns the user's role so the new access token needs no extra query.
 func (q *Queries) RotateSession(ctx context.Context, arg RotateSessionParams) (RotateSessionRow, error) {
-	row := q.db.QueryRow(ctx, rotateSession, arg.RefreshTokenHash, arg.RefreshTokenHash_2)
+	row := q.db.QueryRow(ctx, rotateSession, arg.NewHash, arg.OldHash)
 	var i RotateSessionRow
-	err := row.Scan(&i.ID, &i.UserID, &i.ExpiresAt)
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ExpiresAt,
+		&i.Role,
+	)
 	return i, err
 }
