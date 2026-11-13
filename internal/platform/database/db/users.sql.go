@@ -14,7 +14,7 @@ import (
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (email, password_hash, full_name)
 VALUES ($1, $2, $3)
-RETURNING id, email, full_name, created_at
+RETURNING id, email, full_name, role, created_at
 `
 
 type CreateUserParams struct {
@@ -27,6 +27,7 @@ type CreateUserRow struct {
 	ID        pgtype.UUID        `json:"id"`
 	Email     string             `json:"email"`
 	FullName  string             `json:"full_name"`
+	Role      UserRole           `json:"role"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -37,6 +38,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (CreateU
 		&i.ID,
 		&i.Email,
 		&i.FullName,
+		&i.Role,
 		&i.CreatedAt,
 	)
 	return i, err
