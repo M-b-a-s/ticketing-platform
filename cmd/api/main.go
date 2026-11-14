@@ -17,6 +17,7 @@ import (
 	"github.com/M-b-a-s/ticketing-platform/internal/auth"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/database/db"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/health"
+	pmw "github.com/M-b-a-s/ticketing-platform/internal/platform/middleware"
 )
 
 func main() {
@@ -62,15 +63,36 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	authHandler := auth.NewHandler(authSvc, slog.Default())
+	// NEW (rate limit): limiters
+	trustProxy := os.Getenv("TRUST_PROXY") == "true" // set only when running behind Nginx
+	ipKey := pmw.KeyByIP(trustProxy)
 
-	// CHANGED: chi router instead of http.ServeMux
+	globalLimit := pmw.NewLimiter(100*time.Millisecond, 30) // ~10 req/s per IP, bursts of 30
+	registerLimit := pmw.NewLimiter(20*time.Second, 5)      // ~3 per minute per IP
+	loginLimit := pmw.NewLimiter(6*time.Second, 10)         // ~10 per minute per IP
+	loginEmailLimit := pmw.NewLimiter(30*time.Second, 10)   // per account, from any IP
+
+	// NEW (rate limit): evict idle keys until shutdown so memory stays bounded
+	for _, l := range []*pmw.Limiter{globalLimit, registerLimit, loginLimit, loginEmailLimit} {
+		go l.Run(ctx, time.Minute)
+	}
+
+	// CHANGED (rate limit): handler now receives its limits
+	authHandler := auth.NewHandler(authSvc, slog.Default()).WithLimits(auth.Limits{
+		IPKey:        ipKey,
+		Register:     registerLimit,
+		Login:        loginLimit,
+		LoginByEmail: loginEmailLimit,
+	})
+
+	// router
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 
-	r.Method(http.MethodGet, "/healthz", health.Liveness())
+	r.Method(http.MethodGet, "/healthz", health.Liveness()) // outside the limiter: probes are never throttled
 	r.Route("/v1", func(r chi.Router) {
+		r.Use(pmw.RateLimit(globalLimit, ipKey)) // NEW (rate limit)
 		authHandler.Routes(r)
 	})
 

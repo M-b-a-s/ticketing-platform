@@ -1,37 +1,63 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
-	"time"
-	"context"
 	"net"
+	"net/http"
 	"net/netip"
+	"strings" // NEW (rate limit)
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/database/db"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/httpx"
+	"github.com/M-b-a-s/ticketing-platform/internal/platform/middleware" // NEW (rate limit)
 )
 
 const maxBodyBytes = 8 << 10 // 8 KiB is plenty for a registration payload
 
+// NEW (rate limit): which limiters guard which auth routes.
+// Any nil field simply disables that limit (tests, local dev).
+type Limits struct {
+	IPKey        func(*http.Request) string // how to identify a client
+	Register     *middleware.Limiter        // per IP
+	Login        *middleware.Limiter        // per IP
+	LoginByEmail *middleware.Limiter        // per account, whichever IP it comes from
+}
+
 type Handler struct {
-	svc *Service
-	log *slog.Logger
+	svc    *Service
+	log    *slog.Logger
+	limits Limits // NEW (rate limit)
 }
 
 func NewHandler(svc *Service, log *slog.Logger) *Handler {
 	return &Handler{svc: svc, log: log}
 }
 
+// NEW (rate limit)
+func (h *Handler) WithLimits(l Limits) *Handler {
+	h.limits = l
+	return h
+}
+
+// NEW (rate limit): returns a no-op when no limiter is configured.
+func (h *Handler) ipLimit(l *middleware.Limiter) func(http.Handler) http.Handler {
+	if l == nil || h.limits.IPKey == nil {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	return middleware.RateLimit(l, h.limits.IPKey)
+}
+
 func (h *Handler) Routes(r chi.Router) {
-	r.Post("/auth/register", h.register)
-	r.Post("/auth/login", h.login)
+	r.With(h.ipLimit(h.limits.Register)).Post("/auth/register", h.register) // CHANGED (rate limit)
+	r.With(h.ipLimit(h.limits.Login)).Post("/auth/login", h.login)           // CHANGED (rate limit)
 	r.Post("/auth/refresh", h.refresh)
 	r.Post("/auth/logout", h.logout)
 
@@ -133,6 +159,18 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// NEW (rate limit): per-account limit, checked BEFORE any password hashing so a
+	// blocked attempt costs almost nothing. The key is normalized so ADA@x.com and
+	// ada@x.com share a bucket, and unknown emails are limited exactly like real
+	// ones, so the limiter can't be used to discover which accounts exist.
+	if lim := h.limits.LoginByEmail; lim != nil {
+		key := strings.ToLower(strings.TrimSpace(req.Email))
+		if ok, retry := lim.Allow(key); !ok {
+			middleware.WriteRateLimited(w, retry)
+			return
+		}
+	}
+
 	// The login handler calls the service's Login method with the provided email and password, along with the user agent and client IP address. It handles different error cases, returning appropriate HTTP status codes and messages. If successful, it returns a JSON response containing the access token, refresh token, expiration time, and user profile information.
 	res, err := h.svc.Login(r.Context(), LoginInput{
 		Email:     req.Email,
@@ -165,7 +203,6 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 }
-
 
 // clientIP uses the socket address. Behind Nginx this is the proxy's address;
 // we'll revisit trusted forwarding headers at deployment (Phase 10).
@@ -226,7 +263,6 @@ func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 }
-
 
 // -- me returns the caller's profile information. It is protected by the Authenticate middleware, which ensures that the request has a valid access token and extracts the caller's identity from it.
 func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
