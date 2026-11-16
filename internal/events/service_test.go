@@ -14,13 +14,30 @@ import (
 type fakeStore struct {
 	called bool
 	got    db.CreateEventParams
+
+	rows    []db.ListManagedEventsRow
+	listGot db.ListManagedEventsParams
 }
 
 func (f *fakeStore) CreateEvent(_ context.Context, arg db.CreateEventParams) (db.Event, error) {
 	f.called = true
 	f.got = arg
-	return db.Event{Title: arg.Title}, nil
+	return db.Event{
+		ID:          pgtype.UUID{Bytes: [16]byte{1}, Valid: true},
+		OrganizerID: arg.OrganizerID,
+		Title:       arg.Title,
+		VenueName:   arg.VenueName,
+		StartsAt:    arg.StartsAt,
+		EndsAt:      arg.EndsAt,
+		Status:      StatusDraft,
+	}, nil
 }
+
+func (f *fakeStore) ListManagedEvents(_ context.Context, arg db.ListManagedEventsParams) ([]db.ListManagedEventsRow, error) {
+	f.listGot = arg
+	return f.rows, nil
+}
+
 
 func newTestService(store Store) *Service {
 	s := NewService(store)

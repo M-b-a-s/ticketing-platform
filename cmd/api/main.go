@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/M-b-a-s/ticketing-platform/internal/auth"
+	"github.com/M-b-a-s/ticketing-platform/internal/events"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/database/db"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/health"
 	pmw "github.com/M-b-a-s/ticketing-platform/internal/platform/middleware"
@@ -85,6 +86,8 @@ func run() error {
 		LoginByEmail: loginEmailLimit,
 	})
 
+	eventsHandler := events.NewHandler(events.NewService(queries), slog.Default())
+
 	// router
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -94,6 +97,11 @@ func run() error {
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(pmw.RateLimit(globalLimit, ipKey)) // NEW (rate limit)
 		authHandler.Routes(r)
+
+		r.Route("/manage", func(r chi.Router) {
+			r.Use(auth.Authenticate(tokens)) // everything under /manage requires a signed-in user
+			eventsHandler.ManageRoutes(r)
+		})
 	})
 
 	srv := &http.Server{
