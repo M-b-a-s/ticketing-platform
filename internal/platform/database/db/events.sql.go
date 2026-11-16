@@ -73,6 +73,73 @@ func (q *Queries) GetEvent(ctx context.Context, id pgtype.UUID) (Event, error) {
 	return i, err
 }
 
+const listManagedEvents = `-- name: ListManagedEvents :many
+SELECT e.id, e.organizer_id, e.title, e.description, e.venue_name, e.starts_at, e.ends_at, e.status, e.created_at, e.updated_at,
+       COALESCE(e.organizer_id = $1::uuid, false)::boolean AS is_owner,
+       COALESCE(s.role, '')::text                                         AS staff_role
+FROM events e
+LEFT JOIN event_staff s
+  ON s.event_id = e.id AND s.user_id = $1::uuid
+WHERE (e.organizer_id = $1::uuid OR s.user_id IS NOT NULL)
+  AND ($2::timestamptz IS NULL
+       OR (e.starts_at, e.id) < ($2::timestamptz, $3::uuid))
+ORDER BY e.starts_at DESC, e.id DESC
+LIMIT $4::int
+`
+
+type ListManagedEventsParams struct {
+	UserID        pgtype.UUID        `json:"user_id"`
+	AfterStartsAt pgtype.Timestamptz `json:"after_starts_at"`
+	AfterID       pgtype.UUID        `json:"after_id"`
+	PageSize      int32              `json:"page_size"`
+}
+
+type ListManagedEventsRow struct {
+	Event     Event  `json:"event"`
+	IsOwner   bool   `json:"is_owner"`
+	StaffRole string `json:"staff_role"`
+}
+
+// Events the user owns or staffs, newest start first. Keyset pagination:
+// pass the last row's (starts_at, id) as after_*; leave them NULL for page one.
+func (q *Queries) ListManagedEvents(ctx context.Context, arg ListManagedEventsParams) ([]ListManagedEventsRow, error) {
+	rows, err := q.db.Query(ctx, listManagedEvents,
+		arg.UserID,
+		arg.AfterStartsAt,
+		arg.AfterID,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListManagedEventsRow
+	for rows.Next() {
+		var i ListManagedEventsRow
+		if err := rows.Scan(
+			&i.Event.ID,
+			&i.Event.OrganizerID,
+			&i.Event.Title,
+			&i.Event.Description,
+			&i.Event.VenueName,
+			&i.Event.StartsAt,
+			&i.Event.EndsAt,
+			&i.Event.Status,
+			&i.Event.CreatedAt,
+			&i.Event.UpdatedAt,
+			&i.IsOwner,
+			&i.StaffRole,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const transitionEventStatus = `-- name: TransitionEventStatus :one
 UPDATE events
 SET status = $1, updated_at = now()
