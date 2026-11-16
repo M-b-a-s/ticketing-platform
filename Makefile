@@ -1,7 +1,7 @@
 -include .env
 export
 
-.PHONY: up down run-api run-worker build test vet lint tidy migrate-up migrate-down migrate-status
+.PHONY: up down run-api run-worker build test test-integration vet lint tidy migrate-up migrate-down migrate-status
 
 up:
 	docker compose up -d --wait
@@ -25,11 +25,15 @@ vet:
 test:
 	go test -race -count=1 ./...
 
+test-integration:
+	go test -race -tags=integration -count=1 ./tests/integration/...
+
 lint:
 	golangci-lint run
 
 tidy:
 	go mod tidy
+
 migrate-up:
 	goose -dir migrations postgres "$(DATABASE_URL)" up
 
