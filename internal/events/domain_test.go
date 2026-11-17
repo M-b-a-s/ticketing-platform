@@ -98,3 +98,75 @@ func TestValidateForPublish(t *testing.T) {
 		t.Fatalf("an event without ticket types must not publish, got %v", f)
 	}
 }
+
+func ptr[T any](v T) *T { return &v }
+
+func currentEvent() db.Event {
+	return db.Event{
+		Status:   StatusDraft,
+		StartsAt: pgtype.Timestamptz{Time: fixedNow.Add(48 * time.Hour), Valid: true},
+		EndsAt:   pgtype.Timestamptz{Time: fixedNow.Add(52 * time.Hour), Valid: true},
+	}
+}
+
+func TestValidatePatch(t *testing.T) {
+	start, end := fixedNow.Add(48*time.Hour), fixedNow.Add(52*time.Hour)
+
+	cases := []struct {
+		name    string
+		patch   EventPatch
+		current func(*db.Event)
+		field   string // "" means the patch must be valid
+	}{
+		{"title only", EventPatch{Title: ptr("New title")}, nil, ""},
+		{"empty title", EventPatch{Title: ptr("")}, nil, "title"},
+		{"long venue", EventPatch{VenueName: ptr(strings.Repeat("a", MaxVenueLen+1))}, nil, "venue_name"},
+		{"clearing the description is allowed", EventPatch{Description: ptr("")}, nil, ""},
+		{"long description", EventPatch{Description: ptr(strings.Repeat("a", MaxDescriptionLen+1))}, nil, "description"},
+		{"start in the past", EventPatch{StartsAt: ptr(fixedNow.Add(-time.Hour))}, nil, "starts_at"},
+		{"start after the current end", EventPatch{StartsAt: ptr(end.Add(time.Hour))}, nil, "starts_at"},
+		{"end before the current start", EventPatch{EndsAt: ptr(start.Add(-time.Hour))}, nil, "ends_at"},
+		{"extend the end within the span", EventPatch{EndsAt: ptr(end.Add(2 * time.Hour))}, nil, ""},
+		{"span too long", EventPatch{EndsAt: ptr(start.Add(MaxEventSpan + time.Hour))}, nil, "ends_at"},
+		{"move both times", EventPatch{StartsAt: ptr(start.Add(24 * time.Hour)), EndsAt: ptr(end.Add(24 * time.Hour))}, nil, ""},
+		{
+			"title edit on an event that already began",
+			EventPatch{Title: ptr("Typo fixed")},
+			func(e *db.Event) {
+				e.StartsAt = pgtype.Timestamptz{Time: fixedNow.Add(-time.Hour), Valid: true}
+				e.EndsAt = pgtype.Timestamptz{Time: fixedNow.Add(time.Hour), Valid: true}
+			},
+			"",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cur := currentEvent()
+			if c.current != nil {
+				c.current(&cur)
+			}
+			f := ValidatePatch(cur, c.patch, fixedNow)
+
+			if c.field == "" && len(f) != 0 {
+				t.Fatalf("expected a valid patch, got %v", f)
+			}
+			if c.field != "" && f[c.field] == "" {
+				t.Fatalf("expected an error on %q, got %v", c.field, f)
+			}
+		})
+	}
+}
+
+func TestEditableAndEmptyPatch(t *testing.T) {
+	for status, want := range map[string]bool{
+		StatusDraft: true, StatusPublished: true, StatusCancelled: false, StatusCompleted: false,
+	} {
+		if Editable(status) != want {
+			t.Errorf("Editable(%q) should be %v", status, want)
+		}
+	}
+	if !(EventPatch{}).IsEmpty() || (EventPatch{Title: ptr("x")}).IsEmpty() {
+		t.Fatal("IsEmpty is wrong")
+	}
+}

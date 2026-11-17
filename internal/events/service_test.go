@@ -12,11 +12,25 @@ import (
 )
 
 type fakeStore struct {
+	// create
 	called bool
 	got    db.CreateEventParams
 
+	// list
 	rows    []db.ListManagedEventsRow
 	listGot db.ListManagedEventsParams
+
+	// get / update
+	event        db.Event
+	getErr       error
+	getCalled    bool
+	updateGot    db.UpdateEventParams
+	updateErr    error
+	updateCalled bool
+
+	// route guard
+	access    db.GetEventAccessRow
+	accessErr error
 }
 
 func (f *fakeStore) CreateEvent(_ context.Context, arg db.CreateEventParams) (db.Event, error) {
@@ -37,6 +51,29 @@ func (f *fakeStore) ListManagedEvents(_ context.Context, arg db.ListManagedEvent
 	f.listGot = arg
 	return f.rows, nil
 }
+
+func (f *fakeStore) GetEvent(context.Context, pgtype.UUID) (db.Event, error) {
+	f.getCalled = true
+	return f.event, f.getErr
+}
+
+func (f *fakeStore) UpdateEvent(_ context.Context, arg db.UpdateEventParams) (db.Event, error) {
+	f.updateCalled = true
+	f.updateGot = arg
+	if f.updateErr != nil {
+		return db.Event{}, f.updateErr
+	}
+	ev := f.event
+	if arg.Title.Valid {
+		ev.Title = arg.Title.String
+	}
+	return ev, nil
+}
+
+func (f *fakeStore) GetEventAccess(context.Context, db.GetEventAccessParams) (db.GetEventAccessRow, error) {
+	return f.access, f.accessErr
+}
+
 
 
 func newTestService(store Store) *Service {

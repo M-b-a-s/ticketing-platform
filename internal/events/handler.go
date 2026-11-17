@@ -32,7 +32,13 @@ func NewHandler(svc *Service, log *slog.Logger) *Handler {
 func (h *Handler) ManageRoutes(r chi.Router) {
 	creators := auth.RequireRole(auth.RoleOrganizer, auth.RolePlatformAdmin)
 	r.With(creators).Post("/events", h.create)
-	r.Get("/events", h.listManaged) // any signed-in user: organizers see theirs, staff see what they help run
+	r.Get("/events", h.listManaged)
+
+	// Per-event routes: the guards resolve the caller's relationship to THIS event.
+	r.Route("/events/{eventID}", func(r chi.Router) {
+		r.With(auth.RequireEventAccess(h.svc.store, auth.AccessGate, "eventID")).Get("/", h.get)
+		r.With(auth.RequireEventAccess(h.svc.store, auth.AccessManage, "eventID")).Patch("/", h.update)
+	})
 }
 
 // ---- JSON shapes ----
@@ -176,4 +182,83 @@ func (h *Handler) listManaged(w http.ResponseWriter, r *http.Request) {
 		resp.Items = append(resp.Items, managedEventResponse{eventResponse: newEventResponse(it.Event), MyRole: it.MyRole})
 	}
 	httpx.WriteJSON(w, http.StatusOK, resp)
+}
+
+type patchRequest struct {
+	Title       *string    `json:"title"`
+	Description *string    `json:"description"`
+	VenueName   *string    `json:"venue_name"`
+	StartsAt    *time.Time `json:"starts_at"`
+	EndsAt      *time.Time `json:"ends_at"`
+}
+
+type eventDetailResponse struct {
+	eventResponse
+	Access string `json:"access"` // what the caller may do here: "manage" or "gate"
+}
+
+func accessName(a auth.EventAccess) string {
+	switch a {
+	case auth.AccessManage:
+		return "manage"
+	case auth.AccessGate:
+		return "gate"
+	}
+	return "none"
+}
+
+func eventNotFound(w http.ResponseWriter) {
+	httpx.WriteError(w, http.StatusNotFound, "event_not_found", "event not found", nil)
+}
+
+func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
+	id, err := uuidx.Parse(chi.URLParam(r, "eventID"))
+	if err != nil {
+		eventNotFound(w)
+		return
+	}
+
+	ev, err := h.svc.Get(r.Context(), id)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		eventNotFound(w)
+	case err != nil:
+		h.log.ErrorContext(r.Context(), "get event failed", "error", err)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "something went wrong", nil)
+	default:
+		access, _ := auth.EventAccessFrom(r.Context())
+		httpx.WriteJSON(w, http.StatusOK, eventDetailResponse{eventResponse: newEventResponse(ev), Access: accessName(access)})
+	}
+}
+
+func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
+	id, err := uuidx.Parse(chi.URLParam(r, "eventID"))
+	if err != nil {
+		eventNotFound(w)
+		return
+	}
+	var req patchRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+
+	ev, err := h.svc.Update(r.Context(), id, EventPatch{
+		Title: req.Title, Description: req.Description, VenueName: req.VenueName,
+		StartsAt: req.StartsAt, EndsAt: req.EndsAt,
+	})
+
+	var ve *ValidationError
+	switch {
+	case errors.As(err, &ve):
+		httpx.WriteError(w, http.StatusUnprocessableEntity, "validation_failed", "one or more fields are invalid", ve.Fields)
+	case errors.Is(err, ErrNotFound):
+		eventNotFound(w)
+	case errors.Is(err, ErrNotEditable):
+		httpx.WriteError(w, http.StatusConflict, "event_not_editable", "cancelled or completed events cannot be edited", nil)
+	case err != nil:
+		h.log.ErrorContext(r.Context(), "update event failed", "error", err)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "something went wrong", nil)
+	default:
+		httpx.WriteJSON(w, http.StatusOK, newEventResponse(ev))
+	}
 }

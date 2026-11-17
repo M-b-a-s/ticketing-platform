@@ -2,10 +2,14 @@ package events
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/M-b-a-s/ticketing-platform/internal/auth"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/database/db"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/pagination"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/uuidx"
@@ -13,8 +17,11 @@ import (
 
 // Store is the slice of the generated queries the service needs. It grows with each step.
 type Store interface {
+	auth.EventAccessStore // GetEventAccess, used by the route guards
 	CreateEvent(ctx context.Context, arg db.CreateEventParams) (db.Event, error)
 	ListManagedEvents(ctx context.Context, arg db.ListManagedEventsParams) ([]db.ListManagedEventsRow, error)
+	GetEvent(ctx context.Context, id pgtype.UUID) (db.Event, error)
+	UpdateEvent(ctx context.Context, arg db.UpdateEventParams) (db.Event, error)
 }
 
 type ValidationError struct {
@@ -98,4 +105,75 @@ func (s *Service) ListManaged(ctx context.Context, user pgtype.UUID, limit int, 
 		page.NextCursor = &c
 	}
 	return page, nil
+}
+
+var (
+	ErrNotFound    = errors.New("events: event not found")
+	ErrNotEditable = errors.New("events: event can no longer be edited")
+)
+
+func (s *Service) Get(ctx context.Context, id pgtype.UUID) (db.Event, error) {
+	ev, err := s.store.GetEvent(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return db.Event{}, ErrNotFound
+	}
+	return ev, err
+}
+
+// Update applies a partial change to a draft or published event.
+func (s *Service) Update(ctx context.Context, id pgtype.UUID, p EventPatch) (db.Event, error) {
+	p.Normalize()
+	if p.IsEmpty() {
+		return db.Event{}, &ValidationError{Fields: map[string]string{"body": "provide at least one field to change"}}
+	}
+
+	// The read below gives friendly validation errors. The real guarantees are
+	// the status check inside UpdateEvent's WHERE clause and the CHECK constraints.
+	current, err := s.Get(ctx, id)
+	if err != nil {
+		return db.Event{}, err
+	}
+	if !Editable(current.Status) {
+		return db.Event{}, ErrNotEditable
+	}
+	if fields := ValidatePatch(current, p, s.now()); len(fields) > 0 {
+		return db.Event{}, &ValidationError{Fields: fields}
+	}
+
+	updated, err := s.store.UpdateEvent(ctx, db.UpdateEventParams{
+		ID:          id,
+		Title:       optText(p.Title),
+		Description: optText(p.Description),
+		VenueName:   optText(p.VenueName),
+		StartsAt:    optTime(p.StartsAt),
+		EndsAt:      optTime(p.EndsAt),
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows): // the status changed between our read and our write
+		return db.Event{}, ErrNotEditable
+	case isTimeOrderViolation(err): // two edits that were each valid alone clashed
+		return db.Event{}, &ValidationError{Fields: map[string]string{"ends_at": "must be after starts_at"}}
+	case err != nil:
+		return db.Event{}, err
+	}
+	return updated, nil
+}
+
+func isTimeOrderViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23514" && pgErr.ConstraintName == "events_time_order"
+}
+
+func optText(s *string) pgtype.Text {
+	if s == nil {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: *s, Valid: true}
+}
+
+func optTime(t *time.Time) pgtype.Timestamptz {
+	if t == nil {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: t.UTC(), Valid: true}
 }

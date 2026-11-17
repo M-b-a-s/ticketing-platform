@@ -98,3 +98,85 @@ func ValidateForPublish(e db.Event, now time.Time, ticketTypeCount int) map[stri
 	}
 	return f
 }
+
+// EventPatch is a partial update: nil means "leave this field unchanged".
+type EventPatch struct {
+	Title       *string
+	Description *string // pointing at "" clears the description
+	VenueName   *string
+	StartsAt    *time.Time
+	EndsAt      *time.Time
+}
+
+func (p EventPatch) IsEmpty() bool {
+	return p.Title == nil && p.Description == nil && p.VenueName == nil &&
+		p.StartsAt == nil && p.EndsAt == nil
+}
+
+func (p *EventPatch) Normalize() {
+	trim := func(s *string) *string {
+		if s == nil {
+			return nil
+		}
+		v := strings.TrimSpace(*s)
+		return &v
+	}
+	p.Title, p.Description, p.VenueName = trim(p.Title), trim(p.Description), trim(p.VenueName)
+}
+
+// Editable reports whether an event in this status may still be changed.
+func Editable(status string) bool {
+	return status == StatusDraft || status == StatusPublished
+}
+
+// ValidatePatch checks only what the patch touches, against the event as it
+// stands now. "Starts in the future" applies only when starts_at itself is
+// being changed, so fixing a typo in the title of an event that has already
+// begun is still allowed.
+func ValidatePatch(current db.Event, p EventPatch, now time.Time) map[string]string {
+	f := map[string]string{}
+
+	if p.Title != nil {
+		if n := utf8.RuneCountInString(*p.Title); n == 0 || n > MaxTitleLen {
+			f["title"] = "is required and must be at most 120 characters"
+		}
+	}
+	if p.VenueName != nil {
+		if n := utf8.RuneCountInString(*p.VenueName); n == 0 || n > MaxVenueLen {
+			f["venue_name"] = "is required and must be at most 120 characters"
+		}
+	}
+	if p.Description != nil && utf8.RuneCountInString(*p.Description) > MaxDescriptionLen {
+		f["description"] = "must be at most 5000 characters"
+	}
+
+	start, end := current.StartsAt.Time, current.EndsAt.Time
+	if p.StartsAt != nil {
+		start = *p.StartsAt
+		switch {
+		case !start.After(now):
+			f["starts_at"] = "must be in the future"
+		case start.After(now.Add(MaxLeadTime)):
+			f["starts_at"] = "is too far in the future"
+		}
+	}
+	if p.EndsAt != nil {
+		end = *p.EndsAt
+	}
+
+	if p.StartsAt != nil || p.EndsAt != nil {
+		field, order := "ends_at", "must be after starts_at"
+		if p.EndsAt == nil { // only the start moved, so the start is what clashes
+			field, order = "starts_at", "must be before the event's end time"
+		}
+		if _, taken := f[field]; !taken {
+			switch {
+			case !end.After(start):
+				f[field] = order
+			case end.Sub(start) > MaxEventSpan:
+				f[field] = "event cannot last longer than 30 days"
+			}
+		}
+	}
+	return f
+}
