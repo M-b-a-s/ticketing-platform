@@ -1,7 +1,7 @@
 -include .env
 export
 
-.PHONY: up down run-api run-worker build test test-integration vet lint tidy migrate-up migrate-down migrate-status
+.PHONY: up down run-api run-worker build test test-integration dev vet lint tidy migrate-up migrate-down migrate-status
 
 up:
 	docker compose up -d --wait
@@ -15,6 +15,8 @@ run-api:
 run-worker:
 	go run ./cmd/worker
 
+dev:
+	air -c .air.toml
 build:
 	go build -o bin/api ./cmd/api
 	go build -o bin/worker ./cmd/worker

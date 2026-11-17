@@ -36,8 +36,9 @@ func (h *Handler) ManageRoutes(r chi.Router) {
 
 	// Per-event routes: the guards resolve the caller's relationship to THIS event.
 	r.Route("/events/{eventID}", func(r chi.Router) {
+		manage := auth.RequireEventAccess(h.svc.store, auth.AccessManage, "eventID")
 		r.With(auth.RequireEventAccess(h.svc.store, auth.AccessGate, "eventID")).Get("/", h.get)
-		r.With(auth.RequireEventAccess(h.svc.store, auth.AccessManage, "eventID")).Patch("/", h.update)
+		r.With(manage).Patch("/", h.update)
 	})
 }
 
@@ -90,7 +91,7 @@ type managedListResponse struct {
 }
 
 // ---- helpers ----
-
+// decodeBody decodes a JSON request body into dst, returning false and writing a 400 response if the body is invalid.
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
@@ -103,6 +104,7 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
+// caller returns the authenticated caller's user UUID, or writes a 401 response and returns false.
 func caller(w http.ResponseWriter, r *http.Request) (pgtype.UUID, bool) {
 	id, ok := auth.IdentityFrom(r.Context())
 	if ok {
