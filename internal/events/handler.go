@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+	"context"
+	"fmt"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -36,9 +38,13 @@ func (h *Handler) ManageRoutes(r chi.Router) {
 
 	// Per-event routes: the guards resolve the caller's relationship to THIS event.
 	r.Route("/events/{eventID}", func(r chi.Router) {
+		view := auth.RequireEventAccess(h.svc.store, auth.AccessGate, "eventID")
 		manage := auth.RequireEventAccess(h.svc.store, auth.AccessManage, "eventID")
-		r.With(auth.RequireEventAccess(h.svc.store, auth.AccessGate, "eventID")).Get("/", h.get)
+
+		r.With(view).Get("/", h.get)
 		r.With(manage).Patch("/", h.update)
+		r.With(manage).Post("/publish", h.publish)
+		r.With(manage).Post("/cancel", h.cancel)
 	})
 }
 
@@ -259,6 +265,38 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusConflict, "event_not_editable", "cancelled or completed events cannot be edited", nil)
 	case err != nil:
 		h.log.ErrorContext(r.Context(), "update event failed", "error", err)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "something went wrong", nil)
+	default:
+		httpx.WriteJSON(w, http.StatusOK, newEventResponse(ev))
+	}
+}
+
+func (h *Handler) publish(w http.ResponseWriter, r *http.Request) { h.transition(w, r, h.svc.Publish) }
+func (h *Handler) cancel(w http.ResponseWriter, r *http.Request)  { h.transition(w, r, h.svc.Cancel) }
+
+func (h *Handler) transition(w http.ResponseWriter, r *http.Request, do func(context.Context, pgtype.UUID) (db.Event, error)) {
+	id, err := uuidx.Parse(chi.URLParam(r, "eventID"))
+	if err != nil {
+		eventNotFound(w)
+		return
+	}
+
+	ev, err := do(r.Context(), id)
+
+	var ve *ValidationError
+	var te *TransitionError
+	switch {
+	case errors.As(err, &ve):
+		httpx.WriteError(w, http.StatusUnprocessableEntity, "requirements_not_met", "the event does not meet the requirements for this action", ve.Fields)
+	case errors.As(err, &te):
+		httpx.WriteError(w, http.StatusConflict, "invalid_status_transition",
+			fmt.Sprintf("an event that is %s cannot become %s", te.From, te.To), nil)
+	case errors.Is(err, ErrConflict):
+		httpx.WriteError(w, http.StatusConflict, "event_changed", "the event changed while your request was running, reload it and try again", nil)
+	case errors.Is(err, ErrNotFound):
+		eventNotFound(w)
+	case err != nil:
+		h.log.ErrorContext(r.Context(), "event status change failed", "error", err)
 		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "something went wrong", nil)
 	default:
 		httpx.WriteJSON(w, http.StatusOK, newEventResponse(ev))

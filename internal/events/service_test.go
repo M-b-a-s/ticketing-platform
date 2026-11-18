@@ -24,9 +24,18 @@ type fakeStore struct {
 	event        db.Event
 	getErr       error
 	getCalled    bool
+	getQueue     []db.Event // successive GetEvent results, used before falling back to event
 	updateGot    db.UpdateEventParams
 	updateErr    error
 	updateCalled bool
+
+	// publish / cancel
+	count         int64
+	countErr      error
+	publishCalled bool
+	publishErr    error
+	cancelCalled  bool
+	cancelErr     error
 
 	// route guard
 	access    db.GetEventAccessRow
@@ -54,6 +63,11 @@ func (f *fakeStore) ListManagedEvents(_ context.Context, arg db.ListManagedEvent
 
 func (f *fakeStore) GetEvent(context.Context, pgtype.UUID) (db.Event, error) {
 	f.getCalled = true
+	if len(f.getQueue) > 0 {
+		ev := f.getQueue[0]
+		f.getQueue = f.getQueue[1:]
+		return ev, f.getErr
+	}
 	return f.event, f.getErr
 }
 
@@ -67,6 +81,30 @@ func (f *fakeStore) UpdateEvent(_ context.Context, arg db.UpdateEventParams) (db
 	if arg.Title.Valid {
 		ev.Title = arg.Title.String
 	}
+	return ev, nil
+}
+
+func (f *fakeStore) CountTicketTypes(context.Context, pgtype.UUID) (int64, error) {
+	return f.count, f.countErr
+}
+
+func (f *fakeStore) PublishEvent(context.Context, pgtype.UUID) (db.Event, error) {
+	f.publishCalled = true
+	if f.publishErr != nil {
+		return db.Event{}, f.publishErr
+	}
+	ev := f.event
+	ev.Status = StatusPublished
+	return ev, nil
+}
+
+func (f *fakeStore) CancelEvent(context.Context, pgtype.UUID) (db.Event, error) {
+	f.cancelCalled = true
+	if f.cancelErr != nil {
+		return db.Event{}, f.cancelErr
+	}
+	ev := f.event
+	ev.Status = StatusCancelled
 	return ev, nil
 }
 

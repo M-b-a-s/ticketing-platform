@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"time"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -22,6 +23,9 @@ type Store interface {
 	ListManagedEvents(ctx context.Context, arg db.ListManagedEventsParams) ([]db.ListManagedEventsRow, error)
 	GetEvent(ctx context.Context, id pgtype.UUID) (db.Event, error)
 	UpdateEvent(ctx context.Context, arg db.UpdateEventParams) (db.Event, error)
+	CountTicketTypes(ctx context.Context, eventID pgtype.UUID) (int64, error)
+	PublishEvent(ctx context.Context, id pgtype.UUID) (db.Event, error)
+	CancelEvent(ctx context.Context, id pgtype.UUID) (db.Event, error)
 }
 
 type ValidationError struct {
@@ -176,4 +180,79 @@ func optTime(t *time.Time) pgtype.Timestamptz {
 		return pgtype.Timestamptz{}
 	}
 	return pgtype.Timestamptz{Time: t.UTC(), Valid: true}
+}
+
+// ErrConflict means the event changed under us in a way that matters; the
+// client should re-read it and decide again.
+var ErrConflict = errors.New("events: event changed while the request was running")
+
+// TransitionError is a status change the state machine does not allow.
+type TransitionError struct{ From, To string }
+
+func (e *TransitionError) Error() string {
+	return fmt.Sprintf("events: cannot change status from %s to %s", e.From, e.To)
+}
+
+// Publish moves a draft to published. Repeating it on a published event succeeds.
+func (s *Service) Publish(ctx context.Context, id pgtype.UUID) (db.Event, error) {
+	current, err := s.Get(ctx, id)
+	if err != nil {
+		return db.Event{}, err
+	}
+	if current.Status == StatusPublished {
+		return current, nil // idempotent
+	}
+	if !CanTransition(current.Status, StatusPublished) {
+		return db.Event{}, &TransitionError{From: current.Status, To: StatusPublished}
+	}
+
+	// Friendly, field-level errors. The UPDATE below re-checks all of this
+	// atomically, so a change between this read and that write cannot slip through.
+	count, err := s.store.CountTicketTypes(ctx, id)
+	if err != nil {
+		return db.Event{}, err
+	}
+	if fields := ValidateForPublish(current, s.now(), int(count)); len(fields) > 0 {
+		return db.Event{}, &ValidationError{Fields: fields}
+	}
+
+	updated, err := s.store.PublishEvent(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return s.afterLostRace(ctx, id, StatusPublished)
+	}
+	return updated, err
+}
+
+// Cancel moves a draft or published event to cancelled. Repeating it succeeds.
+func (s *Service) Cancel(ctx context.Context, id pgtype.UUID) (db.Event, error) {
+	current, err := s.Get(ctx, id)
+	if err != nil {
+		return db.Event{}, err
+	}
+	if current.Status == StatusCancelled {
+		return current, nil // idempotent
+	}
+	if !CanTransition(current.Status, StatusCancelled) {
+		return db.Event{}, &TransitionError{From: current.Status, To: StatusCancelled}
+	}
+
+	updated, err := s.store.CancelEvent(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return s.afterLostRace(ctx, id, StatusCancelled)
+	}
+	return updated, err
+}
+
+// afterLostRace runs when the atomic UPDATE matched nothing: another request got
+// there first, or a precondition changed. If the event is already where this
+// request wanted it, that is success. Anything else is a conflict.
+func (s *Service) afterLostRace(ctx context.Context, id pgtype.UUID, want string) (db.Event, error) {
+	current, err := s.Get(ctx, id)
+	if err != nil {
+		return db.Event{}, err
+	}
+	if current.Status == want {
+		return current, nil
+	}
+	return db.Event{}, ErrConflict
 }

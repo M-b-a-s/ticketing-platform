@@ -41,3 +41,23 @@ WHERE (e.organizer_id = sqlc.arg(user_id)::uuid OR s.user_id IS NOT NULL)
        OR (e.starts_at, e.id) < (sqlc.narg(after_starts_at)::timestamptz, sqlc.narg(after_id)::uuid))
 ORDER BY e.starts_at DESC, e.id DESC
 LIMIT sqlc.arg(page_size)::int;
+
+-- name: CountTicketTypes :one
+SELECT count(*) FROM ticket_types WHERE event_id = $1;
+
+-- name: PublishEvent :one
+-- Atomic: publishes only if the event is still a draft, still starts in the
+-- future, and has at least one ticket type, all judged inside this statement.
+UPDATE events
+SET status = 'published', updated_at = now()
+WHERE events.id = $1
+  AND events.status = 'draft'
+  AND events.starts_at > now()
+  AND EXISTS (SELECT 1 FROM ticket_types t WHERE t.event_id = events.id)
+RETURNING *;
+
+-- name: CancelEvent :one
+UPDATE events
+SET status = 'cancelled', updated_at = now()
+WHERE id = $1 AND status IN ('draft', 'published')
+RETURNING *;

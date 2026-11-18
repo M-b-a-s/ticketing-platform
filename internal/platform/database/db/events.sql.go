@@ -11,6 +11,42 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelEvent = `-- name: CancelEvent :one
+UPDATE events
+SET status = 'cancelled', updated_at = now()
+WHERE id = $1 AND status IN ('draft', 'published')
+RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at
+`
+
+func (q *Queries) CancelEvent(ctx context.Context, id pgtype.UUID) (Event, error) {
+	row := q.db.QueryRow(ctx, cancelEvent, id)
+	var i Event
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizerID,
+		&i.Title,
+		&i.Description,
+		&i.VenueName,
+		&i.StartsAt,
+		&i.EndsAt,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const countTicketTypes = `-- name: CountTicketTypes :one
+SELECT count(*) FROM ticket_types WHERE event_id = $1
+`
+
+func (q *Queries) CountTicketTypes(ctx context.Context, eventID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countTicketTypes, eventID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createEvent = `-- name: CreateEvent :one
 INSERT INTO events (organizer_id, title, description, venue_name, starts_at, ends_at)
 VALUES ($1, $2, $3, $4, $5, $6)
@@ -138,6 +174,36 @@ func (q *Queries) ListManagedEvents(ctx context.Context, arg ListManagedEventsPa
 		return nil, err
 	}
 	return items, nil
+}
+
+const publishEvent = `-- name: PublishEvent :one
+UPDATE events
+SET status = 'published', updated_at = now()
+WHERE events.id = $1
+  AND events.status = 'draft'
+  AND events.starts_at > now()
+  AND EXISTS (SELECT 1 FROM ticket_types t WHERE t.event_id = events.id)
+RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at
+`
+
+// Atomic: publishes only if the event is still a draft, still starts in the
+// future, and has at least one ticket type, all judged inside this statement.
+func (q *Queries) PublishEvent(ctx context.Context, id pgtype.UUID) (Event, error) {
+	row := q.db.QueryRow(ctx, publishEvent, id)
+	var i Event
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizerID,
+		&i.Title,
+		&i.Description,
+		&i.VenueName,
+		&i.StartsAt,
+		&i.EndsAt,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const transitionEventStatus = `-- name: TransitionEventStatus :one
