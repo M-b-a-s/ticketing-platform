@@ -15,7 +15,7 @@ const cancelEvent = `-- name: CancelEvent :one
 UPDATE events
 SET status = 'cancelled', updated_at = now()
 WHERE id = $1 AND status IN ('draft', 'published')
-RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at
+RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at, published_at
 `
 
 func (q *Queries) CancelEvent(ctx context.Context, id pgtype.UUID) (Event, error) {
@@ -32,6 +32,7 @@ func (q *Queries) CancelEvent(ctx context.Context, id pgtype.UUID) (Event, error
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PublishedAt,
 	)
 	return i, err
 }
@@ -50,7 +51,7 @@ func (q *Queries) CountTicketTypes(ctx context.Context, eventID pgtype.UUID) (in
 const createEvent = `-- name: CreateEvent :one
 INSERT INTO events (organizer_id, title, description, venue_name, starts_at, ends_at)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at
+RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at, published_at
 `
 
 type CreateEventParams struct {
@@ -83,12 +84,13 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PublishedAt,
 	)
 	return i, err
 }
 
 const getEvent = `-- name: GetEvent :one
-SELECT id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at FROM events WHERE id = $1
+SELECT id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at, published_at FROM events WHERE id = $1
 `
 
 func (q *Queries) GetEvent(ctx context.Context, id pgtype.UUID) (Event, error) {
@@ -105,12 +107,42 @@ func (q *Queries) GetEvent(ctx context.Context, id pgtype.UUID) (Event, error) {
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PublishedAt,
+	)
+	return i, err
+}
+
+const getPublicEvent = `-- name: GetPublicEvent :one
+SELECT e.id, e.organizer_id, e.title, e.description, e.venue_name, e.starts_at, e.ends_at, e.status, e.created_at, e.updated_at, e.published_at
+FROM events e
+WHERE e.id = $1
+  AND e.published_at IS NOT NULL
+  AND e.status <> 'draft'
+`
+
+// Visible only if the event was ever published. A draft, or a draft that was
+// cancelled before anyone saw it, returns no row.
+func (q *Queries) GetPublicEvent(ctx context.Context, id pgtype.UUID) (Event, error) {
+	row := q.db.QueryRow(ctx, getPublicEvent, id)
+	var i Event
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizerID,
+		&i.Title,
+		&i.Description,
+		&i.VenueName,
+		&i.StartsAt,
+		&i.EndsAt,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.PublishedAt,
 	)
 	return i, err
 }
 
 const listManagedEvents = `-- name: ListManagedEvents :many
-SELECT e.id, e.organizer_id, e.title, e.description, e.venue_name, e.starts_at, e.ends_at, e.status, e.created_at, e.updated_at,
+SELECT e.id, e.organizer_id, e.title, e.description, e.venue_name, e.starts_at, e.ends_at, e.status, e.created_at, e.updated_at, e.published_at,
        COALESCE(e.organizer_id = $1::uuid, false)::boolean AS is_owner,
        COALESCE(s.role, '')::text                                         AS staff_role
 FROM events e
@@ -163,6 +195,7 @@ func (q *Queries) ListManagedEvents(ctx context.Context, arg ListManagedEventsPa
 			&i.Event.Status,
 			&i.Event.CreatedAt,
 			&i.Event.UpdatedAt,
+			&i.Event.PublishedAt,
 			&i.IsOwner,
 			&i.StaffRole,
 		); err != nil {
@@ -176,14 +209,65 @@ func (q *Queries) ListManagedEvents(ctx context.Context, arg ListManagedEventsPa
 	return items, nil
 }
 
+const listPublicEvents = `-- name: ListPublicEvents :many
+SELECT e.id, e.organizer_id, e.title, e.description, e.venue_name, e.starts_at, e.ends_at, e.status, e.created_at, e.updated_at, e.published_at
+FROM events e
+WHERE e.status = 'published'
+  AND e.ends_at > now()
+  AND ($1::timestamptz IS NULL
+       OR (e.starts_at, e.id) > ($1::timestamptz, $2::uuid))
+ORDER BY e.starts_at ASC, e.id ASC
+LIMIT $3::int
+`
+
+type ListPublicEventsParams struct {
+	AfterStartsAt pgtype.Timestamptz `json:"after_starts_at"`
+	AfterID       pgtype.UUID        `json:"after_id"`
+	PageSize      int32              `json:"page_size"`
+}
+
+// Upcoming (or still running) published events, soonest first. Keyset pagination:
+// pass the last row's (starts_at, id) as after_*; leave them NULL for page one.
+func (q *Queries) ListPublicEvents(ctx context.Context, arg ListPublicEventsParams) ([]Event, error) {
+	rows, err := q.db.Query(ctx, listPublicEvents, arg.AfterStartsAt, arg.AfterID, arg.PageSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Event
+	for rows.Next() {
+		var i Event
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrganizerID,
+			&i.Title,
+			&i.Description,
+			&i.VenueName,
+			&i.StartsAt,
+			&i.EndsAt,
+			&i.Status,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.PublishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const publishEvent = `-- name: PublishEvent :one
 UPDATE events
-SET status = 'published', updated_at = now()
+SET status = 'published', published_at = now(), updated_at = now()
 WHERE events.id = $1
   AND events.status = 'draft'
   AND events.starts_at > now()
   AND EXISTS (SELECT 1 FROM ticket_types t WHERE t.event_id = events.id)
-RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at
+RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at, published_at
 `
 
 // Atomic: publishes only if the event is still a draft, still starts in the
@@ -202,6 +286,7 @@ func (q *Queries) PublishEvent(ctx context.Context, id pgtype.UUID) (Event, erro
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PublishedAt,
 	)
 	return i, err
 }
@@ -210,7 +295,7 @@ const transitionEventStatus = `-- name: TransitionEventStatus :one
 UPDATE events
 SET status = $1, updated_at = now()
 WHERE id = $2 AND status = $3
-RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at
+RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at, published_at
 `
 
 type TransitionEventStatusParams struct {
@@ -220,6 +305,8 @@ type TransitionEventStatusParams struct {
 }
 
 // Compare-and-swap: succeeds only if the event is still in from_status.
+// NOTE: do not use this to publish. Publishing goes through PublishEvent,
+// which also stamps published_at and re-checks the publish requirements.
 func (q *Queries) TransitionEventStatus(ctx context.Context, arg TransitionEventStatusParams) (Event, error) {
 	row := q.db.QueryRow(ctx, transitionEventStatus, arg.ToStatus, arg.ID, arg.FromStatus)
 	var i Event
@@ -234,6 +321,7 @@ func (q *Queries) TransitionEventStatus(ctx context.Context, arg TransitionEvent
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PublishedAt,
 	)
 	return i, err
 }
@@ -248,7 +336,7 @@ UPDATE events SET
   updated_at  = now()
 WHERE id = $6
   AND status IN ('draft', 'published')
-RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at
+RETURNING id, organizer_id, title, description, venue_name, starts_at, ends_at, status, created_at, updated_at, published_at
 `
 
 type UpdateEventParams struct {
@@ -283,6 +371,7 @@ func (q *Queries) UpdateEvent(ctx context.Context, arg UpdateEventParams) (Event
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PublishedAt,
 	)
 	return i, err
 }

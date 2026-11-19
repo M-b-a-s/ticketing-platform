@@ -26,6 +26,8 @@ type Store interface {
 	CountTicketTypes(ctx context.Context, eventID pgtype.UUID) (int64, error)
 	PublishEvent(ctx context.Context, id pgtype.UUID) (db.Event, error)
 	CancelEvent(ctx context.Context, id pgtype.UUID) (db.Event, error)
+	ListPublicEvents(ctx context.Context, arg db.ListPublicEventsParams) ([]db.Event, error)
+	GetPublicEvent(ctx context.Context, id pgtype.UUID) (db.Event, error)
 }
 
 type ValidationError struct {
@@ -255,4 +257,51 @@ func (s *Service) afterLostRace(ctx context.Context, id pgtype.UUID, want string
 		return current, nil
 	}
 	return db.Event{}, ErrConflict
+}
+
+type PublicPage struct {
+	Items      []db.Event
+	NextCursor *string // nil on the last page
+}
+
+// ListPublic returns one page of upcoming published events, soonest first.
+func (s *Service) ListPublic(ctx context.Context, limit int, after *pagination.Cursor) (PublicPage, error) {
+	params := db.ListPublicEventsParams{PageSize: int32(limit + 1)} // one extra row tells us whether another page exists
+	if after != nil {
+		id, err := uuidx.Parse(after.ID)
+		if err != nil {
+			return PublicPage{}, pagination.ErrInvalidCursor
+		}
+		params.AfterStartsAt = pgtype.Timestamptz{Time: after.Time, Valid: true}
+		params.AfterID = id
+	}
+
+	rows, err := s.store.ListPublicEvents(ctx, params)
+	if err != nil {
+		return PublicPage{}, err
+	}
+
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+	page := PublicPage{Items: rows}
+	if page.Items == nil {
+		page.Items = []db.Event{}
+	}
+	if hasMore {
+		last := rows[len(rows)-1]
+		c := pagination.Encode(pagination.Cursor{Time: last.StartsAt.Time, ID: uuidx.String(last.ID)})
+		page.NextCursor = &c
+	}
+	return page, nil
+}
+
+// GetPublic returns an event only if it was ever published.
+func (s *Service) GetPublic(ctx context.Context, id pgtype.UUID) (db.Event, error) {
+	ev, err := s.store.GetPublicEvent(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return db.Event{}, ErrNotFound
+	}
+	return ev, err
 }

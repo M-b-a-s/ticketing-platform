@@ -22,6 +22,8 @@ RETURNING *;
 
 -- name: TransitionEventStatus :one
 -- Compare-and-swap: succeeds only if the event is still in from_status.
+-- NOTE: do not use this to publish. Publishing goes through PublishEvent,
+-- which also stamps published_at and re-checks the publish requirements.
 UPDATE events
 SET status = sqlc.arg(to_status), updated_at = now()
 WHERE id = sqlc.arg(id) AND status = sqlc.arg(from_status)
@@ -49,7 +51,7 @@ SELECT count(*) FROM ticket_types WHERE event_id = $1;
 -- Atomic: publishes only if the event is still a draft, still starts in the
 -- future, and has at least one ticket type, all judged inside this statement.
 UPDATE events
-SET status = 'published', updated_at = now()
+SET status = 'published', published_at = now(), updated_at = now()
 WHERE events.id = $1
   AND events.status = 'draft'
   AND events.starts_at > now()
@@ -61,3 +63,24 @@ UPDATE events
 SET status = 'cancelled', updated_at = now()
 WHERE id = $1 AND status IN ('draft', 'published')
 RETURNING *;
+
+-- name: ListPublicEvents :many
+-- Upcoming (or still running) published events, soonest first. Keyset pagination:
+-- pass the last row's (starts_at, id) as after_*; leave them NULL for page one.
+SELECT e.*
+FROM events e
+WHERE e.status = 'published'
+  AND e.ends_at > now()
+  AND (sqlc.narg(after_starts_at)::timestamptz IS NULL
+       OR (e.starts_at, e.id) > (sqlc.narg(after_starts_at)::timestamptz, sqlc.narg(after_id)::uuid))
+ORDER BY e.starts_at ASC, e.id ASC
+LIMIT sqlc.arg(page_size)::int;
+
+-- name: GetPublicEvent :one
+-- Visible only if the event was ever published. A draft, or a draft that was
+-- cancelled before anyone saw it, returns no row.
+SELECT e.*
+FROM events e
+WHERE e.id = $1
+  AND e.published_at IS NOT NULL
+  AND e.status <> 'draft';

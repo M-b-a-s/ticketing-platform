@@ -86,6 +86,7 @@ type Event struct {
 	Status      string             `json:"status"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	PublishedAt pgtype.Timestamptz `json:"published_at"`
 }
 
 type EventStaff struct {

@@ -59,20 +59,21 @@ type eventRequest struct {
 }
 
 type eventResponse struct {
-	ID          string    `json:"id"`
-	OrganizerID string    `json:"organizer_id"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	VenueName   string    `json:"venue_name"`
-	StartsAt    time.Time `json:"starts_at"`
-	EndsAt      time.Time `json:"ends_at"`
-	Status      string    `json:"status"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          string     `json:"id"`
+	OrganizerID string     `json:"organizer_id"`
+	Title       string     `json:"title"`
+	Description string     `json:"description"`
+	VenueName   string     `json:"venue_name"`
+	StartsAt    time.Time  `json:"starts_at"`
+	EndsAt      time.Time  `json:"ends_at"`
+	Status      string     `json:"status"`
+	PublishedAt *time.Time `json:"published_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 func newEventResponse(e db.Event) eventResponse {
-	return eventResponse{
+	resp := eventResponse{
 		ID:          uuidx.String(e.ID),
 		OrganizerID: uuidx.String(e.OrganizerID),
 		Title:       e.Title,
@@ -84,6 +85,11 @@ func newEventResponse(e db.Event) eventResponse {
 		CreatedAt:   e.CreatedAt.Time.UTC(),
 		UpdatedAt:   e.UpdatedAt.Time.UTC(),
 	}
+	if e.PublishedAt.Valid {
+		t := e.PublishedAt.Time.UTC()
+		resp.PublishedAt = &t
+	}
+	return resp
 }
 
 type managedEventResponse struct {
@@ -300,5 +306,108 @@ func (h *Handler) transition(w http.ResponseWriter, r *http.Request, do func(con
 		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "something went wrong", nil)
 	default:
 		httpx.WriteJSON(w, http.StatusOK, newEventResponse(ev))
+	}
+}
+
+
+// PublicRoutes needs no login. Mount it directly under /v1.
+func (h *Handler) PublicRoutes(r chi.Router) {
+	r.Get("/events", h.listPublic)
+	r.Get("/events/{eventID}", h.getPublic)
+}
+
+// The public shape is deliberately smaller than the manage shape:
+// no organizer_id, no internal timestamps.
+type publicEventResponse struct {
+	ID          string    `json:"id"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	VenueName   string    `json:"venue_name"`
+	StartsAt    time.Time `json:"starts_at"`
+	EndsAt      time.Time `json:"ends_at"`
+	Status      string    `json:"status"`
+}
+
+func newPublicEventResponse(e db.Event) publicEventResponse {
+	return publicEventResponse{
+		ID:          uuidx.String(e.ID),
+		Title:       e.Title,
+		Description: e.Description.String,
+		VenueName:   e.VenueName,
+		StartsAt:    e.StartsAt.Time.UTC(),
+		EndsAt:      e.EndsAt.Time.UTC(),
+		Status:      e.Status,
+	}
+}
+
+type publicListResponse struct {
+	Items      []publicEventResponse `json:"items"`
+	NextCursor *string               `json:"next_cursor"`
+}
+
+// A few seconds of shared caching absorbs most browse traffic during a sale spike.
+const publicCacheControl = "public, max-age=15"
+
+// pageParams reads and validates ?limit= and ?cursor=, writing the 400 itself on failure.
+func pageParams(w http.ResponseWriter, r *http.Request) (int, *pagination.Cursor, bool) {
+	limit, err := pagination.ParseLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_query", "limit must be a positive integer", nil)
+		return 0, nil, false
+	}
+	var after *pagination.Cursor
+	if raw := r.URL.Query().Get("cursor"); raw != "" {
+		c, err := pagination.Decode(raw)
+		if err != nil {
+			httpx.WriteError(w, http.StatusBadRequest, "invalid_query", "cursor is invalid", nil)
+			return 0, nil, false
+		}
+		after = &c
+	}
+	return limit, after, true
+}
+
+func (h *Handler) listPublic(w http.ResponseWriter, r *http.Request) {
+	limit, after, ok := pageParams(w, r)
+	if !ok {
+		return
+	}
+
+	page, err := h.svc.ListPublic(r.Context(), limit, after)
+	switch {
+	case errors.Is(err, pagination.ErrInvalidCursor):
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_query", "cursor is invalid", nil)
+		return
+	case err != nil:
+		h.log.ErrorContext(r.Context(), "list public events failed", "error", err)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "something went wrong", nil)
+		return
+	}
+
+	resp := publicListResponse{Items: make([]publicEventResponse, 0, len(page.Items)), NextCursor: page.NextCursor}
+	for _, e := range page.Items {
+		resp.Items = append(resp.Items, newPublicEventResponse(e))
+	}
+	w.Header().Set("Cache-Control", publicCacheControl)
+	httpx.WriteJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) getPublic(w http.ResponseWriter, r *http.Request) {
+	id, err := uuidx.Parse(chi.URLParam(r, "eventID"))
+	if err != nil {
+		eventNotFound(w)
+		return
+	}
+
+	ev, err := h.svc.GetPublic(r.Context(), id)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		eventNotFound(w)
+	case err != nil:
+		h.log.ErrorContext(r.Context(), "get public event failed", "error", err)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "something went wrong", nil)
+	default:
+		w.Header().Set("Cache-Control", publicCacheControl)
+		httpx.WriteJSON(w, http.StatusOK, newPublicEventResponse(ev))
 	}
 }

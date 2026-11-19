@@ -37,6 +37,12 @@ type fakeStore struct {
 	cancelCalled  bool
 	cancelErr     error
 
+	// public
+	publicRows    []db.Event
+	publicListGot db.ListPublicEventsParams
+	publicEvent   db.Event
+	publicGetErr  error
+
 	// route guard
 	access    db.GetEventAccessRow
 	accessErr error
@@ -106,6 +112,15 @@ func (f *fakeStore) CancelEvent(context.Context, pgtype.UUID) (db.Event, error) 
 	ev := f.event
 	ev.Status = StatusCancelled
 	return ev, nil
+}
+
+func (f *fakeStore) ListPublicEvents(_ context.Context, arg db.ListPublicEventsParams) ([]db.Event, error) {
+	f.publicListGot = arg
+	return f.publicRows, nil
+}
+
+func (f *fakeStore) GetPublicEvent(context.Context, pgtype.UUID) (db.Event, error) {
+	return f.publicEvent, f.publicGetErr
 }
 
 func (f *fakeStore) GetEventAccess(context.Context, db.GetEventAccessParams) (db.GetEventAccessRow, error) {

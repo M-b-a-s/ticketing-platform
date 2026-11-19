@@ -97,6 +97,7 @@ func run() error {
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(pmw.RateLimit(globalLimit, ipKey)) // NEW (rate limit)
 		authHandler.Routes(r)
+		eventsHandler.PublicRoutes(r)
 
 		r.Route("/manage", func(r chi.Router) {
 			r.Use(auth.Authenticate(tokens)) // everything under /manage requires a signed-in user
