@@ -28,6 +28,7 @@ type Store interface {
 	CancelEvent(ctx context.Context, id pgtype.UUID) (db.Event, error)
 	ListPublicEvents(ctx context.Context, arg db.ListPublicEventsParams) ([]db.Event, error)
 	GetPublicEvent(ctx context.Context, id pgtype.UUID) (db.Event, error)
+	MaxTicketSalesEnd(ctx context.Context, eventID pgtype.UUID) (pgtype.Timestamptz, error)
 }
 
 type ValidationError struct {
@@ -144,6 +145,19 @@ func (s *Service) Update(ctx context.Context, id pgtype.UUID, p EventPatch) (db.
 	}
 	if fields := ValidatePatch(current, p, s.now()); len(fields) > 0 {
 		return db.Event{}, &ValidationError{Fields: fields}
+	}
+
+		// An event cannot end before its ticket sales do.
+	if p.EndsAt != nil {
+		maxEnd, err := s.store.MaxTicketSalesEnd(ctx, id)
+		if err != nil {
+			return db.Event{}, err
+		}
+		if maxEnd.Valid && maxEnd.Time.After(*p.EndsAt) {
+			return db.Event{}, &ValidationError{Fields: map[string]string{
+				"ends_at": "must not be before the sales end of an existing ticket type (" + maxEnd.Time.UTC().Format(time.RFC3339) + ")",
+			}}
+		}
 	}
 
 	updated, err := s.store.UpdateEvent(ctx, db.UpdateEventParams{

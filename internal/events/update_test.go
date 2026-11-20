@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -108,6 +109,29 @@ func TestUpdateMapsTimeOrderConstraintToValidationError(t *testing.T) {
 	var ve *ValidationError
 	if !errors.As(err, &ve) || ve.Fields["ends_at"] == "" {
 		t.Fatalf("want a validation error on ends_at, got %v", err)
+	}
+}
+
+func TestUpdateRefusesAnEndBeforeTicketSales(t *testing.T) {
+	store := storeWithEvent() // starts in 48h, ends in 52h
+	store.maxSalesEnd = pgtype.Timestamptz{Time: fixedNow.Add(51 * time.Hour), Valid: true}
+	newEnd := fixedNow.Add(50 * time.Hour)
+
+	_, err := newTestService(store).Update(context.Background(), eventID, EventPatch{EndsAt: &newEnd})
+
+	var ve *ValidationError
+	if !errors.As(err, &ve) || ve.Fields["ends_at"] == "" || store.updateCalled {
+		t.Fatalf("want an ends_at error and no write, got %v called=%v", err, store.updateCalled)
+	}
+}
+
+func TestUpdateAllowsAnEndAfterTicketSales(t *testing.T) {
+	store := storeWithEvent()
+	store.maxSalesEnd = pgtype.Timestamptz{Time: fixedNow.Add(49 * time.Hour), Valid: true}
+	newEnd := fixedNow.Add(50 * time.Hour)
+
+	if _, err := newTestService(store).Update(context.Background(), eventID, EventPatch{EndsAt: &newEnd}); err != nil {
+		t.Fatalf("an end after every sales window is fine, got %v", err)
 	}
 }
 

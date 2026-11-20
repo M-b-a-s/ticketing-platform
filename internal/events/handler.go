@@ -33,19 +33,18 @@ func NewHandler(svc *Service, log *slog.Logger) *Handler {
 // ManageRoutes must be mounted behind auth.Authenticate, under /v1/manage.
 func (h *Handler) ManageRoutes(r chi.Router) {
 	creators := auth.RequireRole(auth.RoleOrganizer, auth.RolePlatformAdmin)
+	view := auth.RequireEventAccess(h.svc.store, auth.AccessGate, "eventID")
+	manage := auth.RequireEventAccess(h.svc.store, auth.AccessManage, "eventID")
+
 	r.With(creators).Post("/events", h.create)
-	r.Get("/events", h.listManaged)
+	r.Get("/events", h.listManaged) // any signed-in user: organizers see theirs, staff see what they help run
 
-	// Per-event routes: the guards resolve the caller's relationship to THIS event.
-	r.Route("/events/{eventID}", func(r chi.Router) {
-		view := auth.RequireEventAccess(h.svc.store, auth.AccessGate, "eventID")
-		manage := auth.RequireEventAccess(h.svc.store, auth.AccessManage, "eventID")
-
-		r.With(view).Get("/", h.get)
-		r.With(manage).Patch("/", h.update)
-		r.With(manage).Post("/publish", h.publish)
-		r.With(manage).Post("/cancel", h.cancel)
-	})
+	// Per-event routes use full patterns, with no nested Route, so other packages
+	// (ticket types) can add routes under /events/{eventID}/... without a clash.
+	r.With(view).Get("/events/{eventID}", h.get)
+	r.With(manage).Patch("/events/{eventID}", h.update)
+	r.With(manage).Post("/events/{eventID}/publish", h.publish)
+	r.With(manage).Post("/events/{eventID}/cancel", h.cancel)
 }
 
 // ---- JSON shapes ----

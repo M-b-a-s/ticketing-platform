@@ -43,6 +43,10 @@ type fakeStore struct {
 	publicEvent   db.Event
 	publicGetErr  error
 
+	// max sales end
+	maxSalesEnd    pgtype.Timestamptz
+	maxSalesEndErr error
+
 	// route guard
 	access    db.GetEventAccessRow
 	accessErr error
@@ -121,6 +125,10 @@ func (f *fakeStore) ListPublicEvents(_ context.Context, arg db.ListPublicEventsP
 
 func (f *fakeStore) GetPublicEvent(context.Context, pgtype.UUID) (db.Event, error) {
 	return f.publicEvent, f.publicGetErr
+}
+
+func (f *fakeStore) MaxTicketSalesEnd(context.Context, pgtype.UUID) (pgtype.Timestamptz, error) {
+	return f.maxSalesEnd, f.maxSalesEndErr
 }
 
 func (f *fakeStore) GetEventAccess(context.Context, db.GetEventAccessParams) (db.GetEventAccessRow, error) {
