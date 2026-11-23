@@ -10,16 +10,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/M-b-a-s/ticketing-platform/internal/auth"
 	"github.com/M-b-a-s/ticketing-platform/internal/events"
-	"github.com/M-b-a-s/ticketing-platform/internal/tickets"
+	"github.com/M-b-a-s/ticketing-platform/internal/httpapi"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/database/db"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/health"
-	pmw "github.com/M-b-a-s/ticketing-platform/internal/platform/middleware"
+	"github.com/M-b-a-s/ticketing-platform/internal/platform/middleware"
+	"github.com/M-b-a-s/ticketing-platform/internal/tickets"
 )
 
 func main() {
@@ -36,7 +35,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// NEW: database pool
+	// database pool
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		return errors.New("DATABASE_URL is required")
@@ -49,15 +48,13 @@ func run() error {
 	if err := pool.Ping(ctx); err != nil {
 		return err
 	}
+	queries := db.New(pool)
 
-	// NEW: wire auth
-	jwtSecret := os.Getenv("JWT_SECRET")
-	tokens, err := auth.NewTokenManager(jwtSecret, 15*time.Minute)
+	// auth
+	tokens, err := auth.NewTokenManager(os.Getenv("JWT_SECRET"), 15*time.Minute)
 	if err != nil {
 		return err
 	}
-
-	queries := db.New(pool)
 	authSvc, err := auth.NewService(queries, queries, tokens, auth.DefaultParams, auth.Config{
 		RefreshTTL:          30 * 24 * time.Hour,
 		MaxConcurrentHashes: 4,
@@ -65,21 +62,20 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	// NEW (rate limit): limiters
+
+	// rate limiters
 	trustProxy := os.Getenv("TRUST_PROXY") == "true" // set only when running behind Nginx
-	ipKey := pmw.KeyByIP(trustProxy)
+	ipKey := middleware.KeyByIP(trustProxy)
 
-	globalLimit := pmw.NewLimiter(100*time.Millisecond, 30) // ~10 req/s per IP, bursts of 30
-	registerLimit := pmw.NewLimiter(20*time.Second, 5)      // ~3 per minute per IP
-	loginLimit := pmw.NewLimiter(6*time.Second, 10)         // ~10 per minute per IP
-	loginEmailLimit := pmw.NewLimiter(30*time.Second, 10)   // per account, from any IP
-
-	// NEW (rate limit): evict idle keys until shutdown so memory stays bounded
-	for _, l := range []*pmw.Limiter{globalLimit, registerLimit, loginLimit, loginEmailLimit} {
-		go l.Run(ctx, time.Minute)
+	globalLimit := middleware.NewLimiter(100*time.Millisecond, 30) // ~10 req/s per IP, bursts of 30
+	registerLimit := middleware.NewLimiter(20*time.Second, 5)      // ~3 per minute per IP
+	loginLimit := middleware.NewLimiter(6*time.Second, 10)         // ~10 per minute per IP
+	loginEmailLimit := middleware.NewLimiter(30*time.Second, 10)   // per account, from any IP
+	for _, l := range []*middleware.Limiter{globalLimit, registerLimit, loginLimit, loginEmailLimit} {
+		go l.Run(ctx, time.Minute) // evict idle keys until shutdown
 	}
 
-	// CHANGED (rate limit): handler now receives its limits
+	// handlers
 	authHandler := auth.NewHandler(authSvc, slog.Default()).WithLimits(auth.Limits{
 		IPKey:        ipKey,
 		Register:     registerLimit,
@@ -87,32 +83,18 @@ func run() error {
 		LoginByEmail: loginEmailLimit,
 	})
 
-	eventsHandler := events.NewHandler(events.NewService(queries), slog.Default())
-	ticketsHandler := tickets.NewHandler(tickets.NewService(queries), slog.Default())
-
-	// router
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.Recoverer)
-
-	r.Method(http.MethodGet, "/healthz", health.Liveness()) // outside the limiter: probes are never throttled
-
-	r.Route("/v1", func(r chi.Router) {
-		r.Use(pmw.RateLimit(globalLimit, ipKey)) // NEW (rate limit)
-		authHandler.Routes(r)
-		eventsHandler.PublicRoutes(r)
-		ticketsHandler.PublicRoutes(r)
-
-		r.Route("/manage", func(r chi.Router) {
-			r.Use(auth.Authenticate(tokens)) // everything under /manage requires a signed-in user
-			eventsHandler.ManageRoutes(r)
-			ticketsHandler.ManageRoutes(r)
-		})
+	router := httpapi.NewRouter(httpapi.Deps{
+		Tokens:       tokens,
+		Health:       health.Liveness(),
+		Auth:         authHandler,
+		Events:       events.NewHandler(events.NewService(queries), slog.Default()),
+		Tickets:      tickets.NewHandler(tickets.NewService(queries), slog.Default()),
+		V1Middleware: middleware.RateLimit(globalLimit, ipKey),
 	})
 
 	srv := &http.Server{
 		Addr:              getenv("HTTP_ADDR", ":8080"),
-		Handler:           r, // CHANGED
+		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
