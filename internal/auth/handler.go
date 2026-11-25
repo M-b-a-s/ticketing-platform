@@ -9,7 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"strings" // NEW (rate limit)
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -34,7 +34,7 @@ type Limits struct {
 type Handler struct {
 	svc    *Service
 	log    *slog.Logger
-	limits Limits // NEW (rate limit)
+	limits Limits
 }
 
 func NewHandler(svc *Service, log *slog.Logger) *Handler {
