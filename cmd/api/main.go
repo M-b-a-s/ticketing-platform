@@ -19,6 +19,7 @@ import (
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/health"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/middleware"
 	"github.com/M-b-a-s/ticketing-platform/internal/tickets"
+	"github.com/M-b-a-s/ticketing-platform/internal/orders"
 )
 
 func main() {
@@ -71,7 +72,8 @@ func run() error {
 	registerLimit := middleware.NewLimiter(20*time.Second, 5)      // ~3 per minute per IP
 	loginLimit := middleware.NewLimiter(6*time.Second, 10)         // ~10 per minute per IP
 	loginEmailLimit := middleware.NewLimiter(30*time.Second, 10)   // per account, from any IP
-	for _, l := range []*middleware.Limiter{globalLimit, registerLimit, loginLimit, loginEmailLimit} {
+	orderCreateLimit := middleware.NewLimiter(5*time.Second, 6)     // ~12 orders a minute per user, bursts of 6
+	for _, l := range []*middleware.Limiter{globalLimit, registerLimit, loginLimit, loginEmailLimit, orderCreateLimit} {
 		go l.Run(ctx, time.Minute) // evict idle keys until shutdown
 	}
 
@@ -83,12 +85,16 @@ func run() error {
 		LoginByEmail: loginEmailLimit,
 	})
 
+	eventSvc := events.NewService(queries)
+	ticketSvc := tickets.NewService(queries)
+
 	router := httpapi.NewRouter(httpapi.Deps{
 		Tokens:       tokens,
 		Health:       health.Liveness(),
 		Auth:         authHandler,
-		Events:       events.NewHandler(events.NewService(queries), slog.Default()),
-		Tickets:      tickets.NewHandler(tickets.NewService(queries), slog.Default()),
+		Events:       events.NewHandler(eventSvc, slog.Default()),
+		Tickets:      tickets.NewHandler(ticketSvc, slog.Default()),
+		Orders:       orders.NewHandler(orders.NewService(orders.NewPgStore(pool)), slog.Default()).WithCreateLimit(orderCreateLimit),
 		V1Middleware: middleware.RateLimit(globalLimit, ipKey),
 	})
 

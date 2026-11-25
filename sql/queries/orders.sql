@@ -13,7 +13,7 @@ WHERE ticket_types.id = sqlc.arg(id)
   AND ticket_types.sales_end > now()
   AND EXISTS (SELECT 1 FROM events e
               WHERE e.id = ticket_types.event_id AND e.status = 'published' AND e.ends_at > now())
-RETURNING ticket_types.id, ticket_types.price_kobo, ticket_types.currency;
+RETURNING ticket_types.id, ticket_types.name, ticket_types.price_kobo, ticket_types.currency;
 
 -- name: GetTicketTypeForSale :one
 -- Diagnosis only: explains why ReserveTicketType found nothing. Scoped by event.
@@ -45,3 +45,39 @@ RETURNING *;
 INSERT INTO order_items (order_id, event_id, ticket_type_id, quantity, unit_price_kobo)
 VALUES (sqlc.arg(order_id), sqlc.arg(event_id), sqlc.arg(ticket_type_id), sqlc.arg(quantity), sqlc.arg(unit_price_kobo))
 RETURNING *;
+
+-- name: GetOrder :one
+-- Owner-scoped: another user's order is simply not found.
+SELECT * FROM orders WHERE id = sqlc.arg(id) AND user_id = sqlc.arg(user_id);
+
+-- name: ListOrderItems :many
+SELECT i.ticket_type_id, t.name AS ticket_type_name, i.quantity, i.unit_price_kobo
+FROM order_items i
+JOIN ticket_types t ON t.id = i.ticket_type_id
+WHERE i.order_id = $1
+ORDER BY t.name, i.id;
+
+-- name: ListOrdersByUser :many
+-- Keyset pagination, newest first: pass the last row's (created_at, id) as after_*.
+SELECT * FROM orders o
+WHERE o.user_id = sqlc.arg(user_id)
+  AND (sqlc.narg(after_created_at)::timestamptz IS NULL
+       OR (o.created_at, o.id) < (sqlc.narg(after_created_at)::timestamptz, sqlc.narg(after_id)::uuid))
+ORDER BY o.created_at DESC, o.id DESC
+LIMIT sqlc.arg(page_size)::int;
+
+-- name: CancelPendingOrder :one
+-- Atomic: only a still-pending order of this buyer, and only once. Whoever wins this
+-- status change is the one who releases the stock.
+UPDATE orders SET status = 'cancelled', updated_at = now()
+WHERE id = sqlc.arg(id) AND user_id = sqlc.arg(user_id) AND status = 'pending'
+RETURNING *;
+
+-- name: ReleaseOrderStock :exec
+-- Gives an order's tickets back. Call it only in the same transaction that won the
+-- pending -> cancelled/expired transition. (order_id, ticket_type_id) is unique, so
+-- there is one row per ticket type.
+UPDATE ticket_types t
+SET available_quantity = t.available_quantity + i.quantity, updated_at = now()
+FROM order_items i
+WHERE i.order_id = sqlc.arg(order_id) AND t.id = i.ticket_type_id;

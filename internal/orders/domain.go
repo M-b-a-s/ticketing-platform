@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/M-b-a-s/ticketing-platform/internal/platform/database/db"
 )
 
 const (
@@ -27,6 +28,30 @@ type CreateInput struct {
 	UserID  pgtype.UUID // always the authenticated caller, never taken from the request body
 	EventID pgtype.UUID
 	Lines   []Line
+}
+
+// Order statuses must match the orders_status_valid CHECK constraint.
+const (
+	StatusPending   = "pending"
+	StatusPaid      = "paid"
+	StatusFulfilled = "fulfilled"
+	StatusExpired   = "expired"
+	StatusCancelled = "cancelled"
+	StatusRefunded  = "refunded"
+)
+
+// Item is one line of an order as the buyer sees it.
+type Item struct {
+	TicketTypeID  pgtype.UUID
+	Name          string
+	Quantity      int32
+	UnitPriceKobo int64 // the price at the moment of reservation
+}
+
+// View is an order together with its lines.
+type View struct {
+	Order db.Order
+	Items []Item
 }
 
 func (in CreateInput) Validate() map[string]string {

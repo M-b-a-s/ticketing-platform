@@ -11,6 +11,7 @@ import (
 	"github.com/M-b-a-s/ticketing-platform/internal/auth"
 	"github.com/M-b-a-s/ticketing-platform/internal/events"
 	"github.com/M-b-a-s/ticketing-platform/internal/tickets"
+	"github.com/M-b-a-s/ticketing-platform/internal/orders"
 )
 
 type Deps struct {
@@ -19,6 +20,7 @@ type Deps struct {
 	Auth    *auth.Handler
 	Events  *events.Handler
 	Tickets *tickets.Handler
+	Orders  *orders.Handler
 
 	// V1Middleware wraps every /v1 request (the global rate limit). May be nil.
 	V1Middleware func(http.Handler) http.Handler
@@ -47,6 +49,12 @@ func NewRouter(d Deps) chi.Router {
 			r.Use(auth.Authenticate(d.Tokens))
 			d.Events.ManageRoutes(r)
 			d.Tickets.ManageRoutes(r)
+		})
+
+		// buyer routes: signed in, any role
+		r.Group(func(r chi.Router) {
+			r.Use(auth.Authenticate(d.Tokens))
+			d.Orders.Routes(r)
 		})
 	})
 	return r

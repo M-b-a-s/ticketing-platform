@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/database/db"
+	"github.com/M-b-a-s/ticketing-platform/internal/platform/pagination"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/uuidx"
 )
 
@@ -29,21 +31,16 @@ type Service struct{ store Store }
 
 func NewService(store Store) *Service { return &Service{store: store} }
 
-type Result struct {
-	Order db.Order
-	Items []db.OrderItem
-}
-
 // Create reserves the requested tickets and records a pending order that holds them
 // for HoldDuration. It is all or nothing: if any line cannot be reserved, the
 // transaction rolls back and no stock is taken.
-func (s *Service) Create(ctx context.Context, in CreateInput) (Result, error) {
+func (s *Service) Create(ctx context.Context, in CreateInput) (View, error) {
 	if fields := in.Validate(); len(fields) > 0 {
-		return Result{}, &ValidationError{Fields: fields}
+		return View{}, &ValidationError{Fields: fields}
 	}
 	lines := sortedLines(in.Lines)
 
-	var res Result
+	var view View
 	err := s.store.InTx(ctx, func(tx Tx) error {
 		// One buyer's orders for one event are created one at a time, so the cap
 		// below cannot be raced past by simultaneous requests.
@@ -61,6 +58,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Result, error) {
 
 		type taken struct {
 			line  Line
+			name  string
 			price int64
 		}
 		reserved := make([]taken, 0, len(lines))
@@ -83,7 +81,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Result, error) {
 				return &ValidationError{Fields: map[string]string{"items": "ticket types with different currencies cannot share an order"}}
 			}
 			total += row.PriceKobo * int64(l.Quantity) // the price is the database's, never the client's
-			reserved = append(reserved, taken{line: l, price: row.PriceKobo})
+			reserved = append(reserved, taken{line: l, name: row.Name, price: row.PriceKobo})
 		}
 
 		order, err := tx.CreateOrder(ctx, db.CreateOrderParams{
@@ -94,25 +92,113 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Result, error) {
 			return err
 		}
 
-		items := make([]db.OrderItem, 0, len(reserved))
+		items := make([]Item, 0, len(reserved))
 		for _, r := range reserved {
-			item, err := tx.CreateOrderItem(ctx, db.CreateOrderItemParams{
+			if _, err := tx.CreateOrderItem(ctx, db.CreateOrderItemParams{
 				OrderID: order.ID, EventID: in.EventID, TicketTypeID: r.line.TicketTypeID,
 				Quantity: int32(r.line.Quantity), UnitPriceKobo: r.price, // snapshot: later price edits don't touch this order
-			})
-			if err != nil {
+			}); err != nil {
 				return err
 			}
-			items = append(items, item)
+			items = append(items, Item{TicketTypeID: r.line.TicketTypeID, Name: r.name, Quantity: int32(r.line.Quantity), UnitPriceKobo: r.price})
 		}
+		sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name }) // same order as Get
 
-		res = Result{Order: order, Items: items}
+		view = View{Order: order, Items: items}
 		return nil
 	})
 	if err != nil {
-		return Result{}, err
+		return View{}, err
 	}
-	return res, nil
+	return view, nil
+}
+
+// Get returns one of the caller's own orders. Anyone else's order does not exist.
+func (s *Service) Get(ctx context.Context, userID, orderID pgtype.UUID) (View, error) {
+	order, err := s.store.GetOrder(ctx, db.GetOrderParams{ID: orderID, UserID: userID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return View{}, ErrNotFound
+	}
+	if err != nil {
+		return View{}, err
+	}
+	rows, err := s.store.ListOrderItems(ctx, orderID)
+	if err != nil {
+		return View{}, err
+	}
+	items := make([]Item, 0, len(rows))
+	for _, r := range rows {
+		items = append(items, Item{TicketTypeID: r.TicketTypeID, Name: r.TicketTypeName, Quantity: r.Quantity, UnitPriceKobo: r.UnitPriceKobo})
+	}
+	return View{Order: order, Items: items}, nil
+}
+
+type Page struct {
+	Items      []db.Order
+	NextCursor *string // nil on the last page
+}
+
+// List returns one page of the caller's orders, newest first.
+func (s *Service) List(ctx context.Context, userID pgtype.UUID, limit int, after *pagination.Cursor) (Page, error) {
+	params := db.ListOrdersByUserParams{UserID: userID, PageSize: int32(limit + 1)} // the extra row says whether another page exists
+	if after != nil {
+		id, err := uuidx.Parse(after.ID)
+		if err != nil {
+			return Page{}, pagination.ErrInvalidCursor
+		}
+		params.AfterCreatedAt = pgtype.Timestamptz{Time: after.Time, Valid: true}
+		params.AfterID = id
+	}
+
+	rows, err := s.store.ListOrdersByUser(ctx, params)
+	if err != nil {
+		return Page{}, err
+	}
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+	page := Page{Items: rows}
+	if page.Items == nil {
+		page.Items = []db.Order{}
+	}
+	if hasMore {
+		last := rows[len(rows)-1]
+		c := pagination.Encode(pagination.Cursor{Time: last.CreatedAt.Time, ID: uuidx.String(last.ID)})
+		page.NextCursor = &c
+	}
+	return page, nil
+}
+
+// Cancel releases a pending order's tickets. Repeating it succeeds. Stock goes back
+// exactly once: only the request that wins the pending -> cancelled change releases it.
+func (s *Service) Cancel(ctx context.Context, userID, orderID pgtype.UUID) (View, error) {
+	err := s.store.InTx(ctx, func(tx Tx) error {
+		_, err := tx.CancelPendingOrder(ctx, db.CancelPendingOrderParams{ID: orderID, UserID: userID})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // not pending, or not theirs: nothing to release, diagnosed below
+		}
+		if err != nil {
+			return err
+		}
+		return tx.ReleaseOrderStock(ctx, orderID) // same transaction as the status change
+	})
+	if err != nil {
+		return View{}, err
+	}
+
+	view, err := s.Get(ctx, userID, orderID)
+	if err != nil {
+		return View{}, err // ErrNotFound for an order that is not theirs
+	}
+	switch view.Order.Status {
+	case StatusCancelled:
+		return view, nil // we just cancelled it, or it already was
+	case StatusExpired:
+		return View{}, conflict("order_expired", "this order expired and its tickets were released")
+	default: // paid, fulfilled, refunded
+		return View{}, conflict("order_not_cancellable", "this order can no longer be cancelled here")
+	}
 }
 
 // diagnose explains why a line could not be reserved. It runs after the failed

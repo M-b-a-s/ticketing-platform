@@ -11,6 +11,37 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelPendingOrder = `-- name: CancelPendingOrder :one
+UPDATE orders SET status = 'cancelled', updated_at = now()
+WHERE id = $1 AND user_id = $2 AND status = 'pending'
+RETURNING id, user_id, event_id, status, total_kobo, currency, expires_at, paid_at, created_at, updated_at
+`
+
+type CancelPendingOrderParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+// Atomic: only a still-pending order of this buyer, and only once. Whoever wins this
+// status change is the one who releases the stock.
+func (q *Queries) CancelPendingOrder(ctx context.Context, arg CancelPendingOrderParams) (Order, error) {
+	row := q.db.QueryRow(ctx, cancelPendingOrder, arg.ID, arg.UserID)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.EventID,
+		&i.Status,
+		&i.TotalKobo,
+		&i.Currency,
+		&i.ExpiresAt,
+		&i.PaidAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const countPendingOrders = `-- name: CountPendingOrders :one
 SELECT count(*) FROM orders
 WHERE orders.user_id = $1
@@ -106,6 +137,34 @@ func (q *Queries) CreateOrderItem(ctx context.Context, arg CreateOrderItemParams
 	return i, err
 }
 
+const getOrder = `-- name: GetOrder :one
+SELECT id, user_id, event_id, status, total_kobo, currency, expires_at, paid_at, created_at, updated_at FROM orders WHERE id = $1 AND user_id = $2
+`
+
+type GetOrderParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+// Owner-scoped: another user's order is simply not found.
+func (q *Queries) GetOrder(ctx context.Context, arg GetOrderParams) (Order, error) {
+	row := q.db.QueryRow(ctx, getOrder, arg.ID, arg.UserID)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.EventID,
+		&i.Status,
+		&i.TotalKobo,
+		&i.Currency,
+		&i.ExpiresAt,
+		&i.PaidAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getTicketTypeForSale = `-- name: GetTicketTypeForSale :one
 SELECT t.id, t.available_quantity, t.max_per_order, t.sales_start, t.sales_end,
        e.status AS event_status, e.ends_at AS event_ends_at, now()::timestamptz AS db_now
@@ -147,6 +206,99 @@ func (q *Queries) GetTicketTypeForSale(ctx context.Context, arg GetTicketTypeFor
 	return i, err
 }
 
+const listOrderItems = `-- name: ListOrderItems :many
+SELECT i.ticket_type_id, t.name AS ticket_type_name, i.quantity, i.unit_price_kobo
+FROM order_items i
+JOIN ticket_types t ON t.id = i.ticket_type_id
+WHERE i.order_id = $1
+ORDER BY t.name, i.id
+`
+
+type ListOrderItemsRow struct {
+	TicketTypeID   pgtype.UUID `json:"ticket_type_id"`
+	TicketTypeName string      `json:"ticket_type_name"`
+	Quantity       int32       `json:"quantity"`
+	UnitPriceKobo  int64       `json:"unit_price_kobo"`
+}
+
+func (q *Queries) ListOrderItems(ctx context.Context, orderID pgtype.UUID) ([]ListOrderItemsRow, error) {
+	rows, err := q.db.Query(ctx, listOrderItems, orderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListOrderItemsRow
+	for rows.Next() {
+		var i ListOrderItemsRow
+		if err := rows.Scan(
+			&i.TicketTypeID,
+			&i.TicketTypeName,
+			&i.Quantity,
+			&i.UnitPriceKobo,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOrdersByUser = `-- name: ListOrdersByUser :many
+SELECT id, user_id, event_id, status, total_kobo, currency, expires_at, paid_at, created_at, updated_at FROM orders o
+WHERE o.user_id = $1
+  AND ($2::timestamptz IS NULL
+       OR (o.created_at, o.id) < ($2::timestamptz, $3::uuid))
+ORDER BY o.created_at DESC, o.id DESC
+LIMIT $4::int
+`
+
+type ListOrdersByUserParams struct {
+	UserID         pgtype.UUID        `json:"user_id"`
+	AfterCreatedAt pgtype.Timestamptz `json:"after_created_at"`
+	AfterID        pgtype.UUID        `json:"after_id"`
+	PageSize       int32              `json:"page_size"`
+}
+
+// Keyset pagination, newest first: pass the last row's (created_at, id) as after_*.
+func (q *Queries) ListOrdersByUser(ctx context.Context, arg ListOrdersByUserParams) ([]Order, error) {
+	rows, err := q.db.Query(ctx, listOrdersByUser,
+		arg.UserID,
+		arg.AfterCreatedAt,
+		arg.AfterID,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Order
+	for rows.Next() {
+		var i Order
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.EventID,
+			&i.Status,
+			&i.TotalKobo,
+			&i.Currency,
+			&i.ExpiresAt,
+			&i.PaidAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockUserEvent = `-- name: LockUserEvent :exec
 SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))
 `
@@ -155,6 +307,21 @@ SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))
 // cannot be raced past. Released automatically when the transaction ends.
 func (q *Queries) LockUserEvent(ctx context.Context, key string) error {
 	_, err := q.db.Exec(ctx, lockUserEvent, key)
+	return err
+}
+
+const releaseOrderStock = `-- name: ReleaseOrderStock :exec
+UPDATE ticket_types t
+SET available_quantity = t.available_quantity + i.quantity, updated_at = now()
+FROM order_items i
+WHERE i.order_id = $1 AND t.id = i.ticket_type_id
+`
+
+// Gives an order's tickets back. Call it only in the same transaction that won the
+// pending -> cancelled/expired transition. (order_id, ticket_type_id) is unique, so
+// there is one row per ticket type.
+func (q *Queries) ReleaseOrderStock(ctx context.Context, orderID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, releaseOrderStock, orderID)
 	return err
 }
 
@@ -170,7 +337,7 @@ WHERE ticket_types.id = $2
   AND ticket_types.sales_end > now()
   AND EXISTS (SELECT 1 FROM events e
               WHERE e.id = ticket_types.event_id AND e.status = 'published' AND e.ends_at > now())
-RETURNING ticket_types.id, ticket_types.price_kobo, ticket_types.currency
+RETURNING ticket_types.id, ticket_types.name, ticket_types.price_kobo, ticket_types.currency
 `
 
 type ReserveTicketTypeParams struct {
@@ -181,6 +348,7 @@ type ReserveTicketTypeParams struct {
 
 type ReserveTicketTypeRow struct {
 	ID        pgtype.UUID `json:"id"`
+	Name      string      `json:"name"`
 	PriceKobo int64       `json:"price_kobo"`
 	Currency  string      `json:"currency"`
 }
@@ -191,6 +359,11 @@ type ReserveTicketTypeRow struct {
 func (q *Queries) ReserveTicketType(ctx context.Context, arg ReserveTicketTypeParams) (ReserveTicketTypeRow, error) {
 	row := q.db.QueryRow(ctx, reserveTicketType, arg.Quantity, arg.ID, arg.EventID)
 	var i ReserveTicketTypeRow
-	err := row.Scan(&i.ID, &i.PriceKobo, &i.Currency)
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.PriceKobo,
+		&i.Currency,
+	)
 	return i, err
 }
