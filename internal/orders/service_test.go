@@ -52,6 +52,12 @@ func (f *fakeTx) CreateOrderItem(_ context.Context, arg db.CreateOrderItemParams
 	return db.OrderItem{OrderID: arg.OrderID, TicketTypeID: arg.TicketTypeID, Quantity: arg.Quantity, UnitPriceKobo: arg.UnitPriceKobo}, nil
 }
 
+func (f *fakeTx) CancelPendingOrder(context.Context, db.CancelPendingOrderParams) (db.Order, error) {
+	return db.Order{}, pgx.ErrNoRows
+}
+
+func (f *fakeTx) ReleaseOrderStock(context.Context, pgtype.UUID) error { return nil }
+
 type fakeStore struct {
 	tx  *fakeTx
 	ran bool
@@ -60,6 +66,18 @@ type fakeStore struct {
 func (s *fakeStore) InTx(_ context.Context, fn func(Tx) error) error {
 	s.ran = true
 	return fn(s.tx)
+}
+
+func (s *fakeStore) GetOrder(context.Context, db.GetOrderParams) (db.Order, error) {
+	return db.Order{}, pgx.ErrNoRows
+}
+
+func (s *fakeStore) ListOrderItems(context.Context, pgtype.UUID) ([]db.ListOrderItemsRow, error) {
+	return nil, nil
+}
+
+func (s *fakeStore) ListOrdersByUser(context.Context, db.ListOrdersByUserParams) ([]db.Order, error) {
+	return nil, nil
 }
 
 var (
