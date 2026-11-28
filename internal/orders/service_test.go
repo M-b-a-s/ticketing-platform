@@ -63,8 +63,9 @@ func (f *fakeTx) CancelPendingOrder(context.Context, db.CancelPendingOrderParams
 func (f *fakeTx) ReleaseOrderStock(context.Context, pgtype.UUID) error { return nil }
 
 type fakeStore struct {
-	tx  *fakeTx
-	ran bool
+	tx    *fakeTx
+	ran   bool
+	order db.Order
 }
 
 func (s *fakeStore) InTx(_ context.Context, fn func(Tx) error) error {
@@ -73,6 +74,9 @@ func (s *fakeStore) InTx(_ context.Context, fn func(Tx) error) error {
 }
 
 func (s *fakeStore) GetOrder(context.Context, db.GetOrderParams) (db.Order, error) {
+	if s.order.ID.Valid {
+		return s.order, nil
+	}
 	return db.Order{}, pgx.ErrNoRows
 }
 
