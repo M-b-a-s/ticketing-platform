@@ -7,9 +7,14 @@ import (
 	"fmt"
 	"sort"
 	"time"
+	"crypto/sha256"
+	"encoding/hex"
+	"regexp"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/M-b-a-s/ticketing-platform/internal/platform/database/db"
+	"github.com/M-b-a-s/ticketing-platform/internal/platform/uuidx"
 )
 
 const (
@@ -93,4 +98,23 @@ func sortedLines(lines []Line) []Line {
 		return bytes.Compare(out[i].TicketTypeID.Bytes[:], out[j].TicketTypeID.Bytes[:]) < 0
 	})
 	return out
+}
+
+const idempotencyKeyRule = "must be 8 to 64 characters: letters, digits, hyphen or underscore"
+
+var idempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
+
+func ValidIdempotencyKey(key string) bool { return idempotencyKeyPattern.MatchString(key) }
+
+// RequestHash fingerprints WHAT is being bought: the event and the lines, in a fixed
+// order, so the same items listed in a different order are still the same request.
+// The buyer is not part of it, because keys are already scoped per buyer.
+func RequestHash(in CreateInput) string {
+	var b strings.Builder
+	b.WriteString(uuidx.String(in.EventID))
+	for _, l := range sortedLines(in.Lines) {
+		fmt.Fprintf(&b, "|%s:%d", uuidx.String(l.TicketTypeID), l.Quantity)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
 }

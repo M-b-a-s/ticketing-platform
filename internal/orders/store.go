@@ -21,6 +21,9 @@ type Tx interface {
 	CreateOrderItem(ctx context.Context, arg db.CreateOrderItemParams) (db.OrderItem, error)
 	CancelPendingOrder(ctx context.Context, arg db.CancelPendingOrderParams) (db.Order, error)
 	ReleaseOrderStock(ctx context.Context, orderID pgtype.UUID) error
+	ClaimIdempotencyKey(ctx context.Context, arg db.ClaimIdempotencyKeyParams) (pgtype.UUID, error)
+	GetIdempotencyKey(ctx context.Context, arg db.GetIdempotencyKeyParams) (db.GetIdempotencyKeyRow, error)
+	CompleteIdempotencyKey(ctx context.Context, arg db.CompleteIdempotencyKeyParams) error
 }
 
 type Store interface {

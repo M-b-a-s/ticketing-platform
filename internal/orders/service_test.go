@@ -22,6 +22,10 @@ type fakeTx struct {
 	lockedKey    string
 	orderParams  *db.CreateOrderParams
 	itemParams   []db.CreateOrderItemParams
+	claimErr  error // pgx.ErrNoRows means "this key already exists"
+	claimed   []db.ClaimIdempotencyKeyParams
+	prevKey   db.GetIdempotencyKeyRow
+	completed []db.CompleteIdempotencyKeyParams
 }
 
 func (f *fakeTx) LockUserEvent(_ context.Context, key string) error { f.lockedKey = key; return nil }
@@ -78,6 +82,23 @@ func (s *fakeStore) ListOrderItems(context.Context, pgtype.UUID) ([]db.ListOrder
 
 func (s *fakeStore) ListOrdersByUser(context.Context, db.ListOrdersByUserParams) ([]db.Order, error) {
 	return nil, nil
+}
+
+func (f *fakeTx) ClaimIdempotencyKey(_ context.Context, arg db.ClaimIdempotencyKeyParams) (pgtype.UUID, error) {
+	f.claimed = append(f.claimed, arg)
+	if f.claimErr != nil {
+		return pgtype.UUID{}, f.claimErr
+	}
+	return id(200), nil
+}
+
+func (f *fakeTx) GetIdempotencyKey(context.Context, db.GetIdempotencyKeyParams) (db.GetIdempotencyKeyRow, error) {
+	return f.prevKey, nil
+}
+
+func (f *fakeTx) CompleteIdempotencyKey(_ context.Context, arg db.CompleteIdempotencyKeyParams) error {
+	f.completed = append(f.completed, arg)
+	return nil
 }
 
 var (

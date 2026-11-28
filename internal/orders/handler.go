@@ -145,6 +145,12 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 		httpx.WriteError(w, http.StatusConflict, ce.Code, ce.Message, nil)
 	case errors.Is(err, ErrNotFound):
 		notFound(w)
+		case errors.Is(err, ErrKeyReused):
+		httpx.WriteError(w, http.StatusUnprocessableEntity, "idempotency_key_reused",
+			"this Idempotency-Key was already used for a different request", nil)
+	case errors.Is(err, ErrKeyInProgress):
+		httpx.WriteError(w, http.StatusConflict, "idempotency_in_progress",
+			"a request with this Idempotency-Key is still being processed, retry shortly", nil)
 	default:
 		h.log.ErrorContext(r.Context(), "order request failed", "error", err)
 		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "something went wrong", nil)
@@ -182,6 +188,18 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	key := r.Header.Get("Idempotency-Key")
+	switch {
+	case key == "":
+		httpx.WriteError(w, http.StatusBadRequest, "idempotency_key_required",
+			"send an Idempotency-Key header so a retried request cannot buy twice", nil)
+		return
+	case !ValidIdempotencyKey(key):
+		httpx.WriteError(w, http.StatusBadRequest, "invalid_idempotency_key",
+			"Idempotency-Key "+idempotencyKeyRule, nil)
+		return
+	}
+
 	lines := make([]Line, 0, len(req.Items))
 	fields := map[string]string{}
 	for i, it := range req.Items {
@@ -197,10 +215,13 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	view, err := h.svc.Create(r.Context(), CreateInput{UserID: user, EventID: eventID, Lines: lines})
+		view, replayed, err := h.svc.CreateIdempotent(r.Context(), CreateInput{UserID: user, EventID: eventID, Lines: lines}, key)
 	if err != nil {
 		h.fail(w, r, err)
 		return
+	}
+	if replayed {
+		w.Header().Set("Idempotent-Replayed", "true")
 	}
 	w.Header().Set("Location", "/v1/orders/"+uuidx.String(view.Order.ID))
 	writeOrder(w, http.StatusCreated, newOrderResponse(view))
