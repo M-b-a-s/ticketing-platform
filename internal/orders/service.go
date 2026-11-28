@@ -266,7 +266,7 @@ func (s *Service) List(ctx context.Context, userID pgtype.UUID, limit int, after
 // Cancel releases a pending order's tickets. Repeating it succeeds. Stock goes back
 // exactly once: only the request that wins the pending -> cancelled change releases it.
 func (s *Service) Cancel(ctx context.Context, userID, orderID pgtype.UUID) (View, error) {
-	err := s.store.InTx(ctx, func(tx Tx) error {
+		err := s.store.InTx(ctx, func(tx Tx) error {
 		_, err := tx.CancelPendingOrder(ctx, db.CancelPendingOrderParams{ID: orderID, UserID: userID})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil // not pending, or not theirs: nothing to release, diagnosed below
@@ -274,7 +274,11 @@ func (s *Service) Cancel(ctx context.Context, userID, orderID pgtype.UUID) (View
 		if err != nil {
 			return err
 		}
-		return tx.ReleaseOrderStock(ctx, orderID) // same transaction as the status change
+		ids := []pgtype.UUID{orderID}
+		if err := tx.LockTicketTypesOfOrders(ctx, ids); err != nil { // same lock order as every other stock mover
+			return err
+		}
+		return tx.ReleaseStockForOrders(ctx, ids) // same transaction as the status change
 	})
 	if err != nil {
 		return View{}, err

@@ -26,6 +26,7 @@ type fakeTx struct {
 	claimed   []db.ClaimIdempotencyKeyParams
 	prevKey   db.GetIdempotencyKeyRow
 	completed []db.CompleteIdempotencyKeyParams
+	released  []pgtype.UUID
 }
 
 func (f *fakeTx) LockUserEvent(_ context.Context, key string) error { f.lockedKey = key; return nil }
@@ -60,7 +61,12 @@ func (f *fakeTx) CancelPendingOrder(context.Context, db.CancelPendingOrderParams
 	return db.Order{}, pgx.ErrNoRows
 }
 
-func (f *fakeTx) ReleaseOrderStock(context.Context, pgtype.UUID) error { return nil }
+func (f *fakeTx) LockTicketTypesOfOrders(context.Context, []pgtype.UUID) error { return nil }
+
+func (f *fakeTx) ReleaseStockForOrders(_ context.Context, ids []pgtype.UUID) error {
+	f.released = append(f.released, ids...)
+	return nil
+}
 
 type fakeStore struct {
 	tx    *fakeTx

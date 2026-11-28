@@ -20,7 +20,8 @@ type Tx interface {
 	CreateOrder(ctx context.Context, arg db.CreateOrderParams) (db.Order, error)
 	CreateOrderItem(ctx context.Context, arg db.CreateOrderItemParams) (db.OrderItem, error)
 	CancelPendingOrder(ctx context.Context, arg db.CancelPendingOrderParams) (db.Order, error)
-	ReleaseOrderStock(ctx context.Context, orderID pgtype.UUID) error
+	LockTicketTypesOfOrders(ctx context.Context, orderIDs []pgtype.UUID) error
+	ReleaseStockForOrders(ctx context.Context, orderIDs []pgtype.UUID) error
 	ClaimIdempotencyKey(ctx context.Context, arg db.ClaimIdempotencyKeyParams) (pgtype.UUID, error)
 	GetIdempotencyKey(ctx context.Context, arg db.GetIdempotencyKeyParams) (db.GetIdempotencyKeyRow, error)
 	CompleteIdempotencyKey(ctx context.Context, arg db.CompleteIdempotencyKeyParams) error
@@ -35,6 +36,13 @@ type Store interface {
 	GetOrder(ctx context.Context, arg db.GetOrderParams) (db.Order, error)
 	ListOrderItems(ctx context.Context, orderID pgtype.UUID) ([]db.ListOrderItemsRow, error)
 	ListOrdersByUser(ctx context.Context, arg db.ListOrdersByUserParams) ([]db.Order, error)
+}
+
+// InSweepTx is InTx for the sweeper's smaller set of queries.
+func (s *PgStore) InSweepTx(ctx context.Context, fn func(SweepTx) error) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		return fn(db.New(tx))
+	})
 }
 
 type PgStore struct {
